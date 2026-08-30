@@ -13,6 +13,8 @@ pub enum Error {
     NotADirectory(PathBuf),
     /// A file was found but could not be read.
     Read { path: PathBuf, source: io::Error },
+    /// A file was read but is not the YAML it claims to be.
+    Yaml { path: PathBuf, message: String },
 }
 
 impl fmt::Display for Error {
@@ -20,6 +22,9 @@ impl fmt::Display for Error {
         match self {
             Error::NotADirectory(path) => write!(f, "{} is not a directory", path.display()),
             Error::Read { path, source } => write!(f, "cannot read {}: {source}", path.display()),
+            Error::Yaml { path, message } => {
+                write!(f, "cannot parse {}: {message}", path.display())
+            }
         }
     }
 }
@@ -27,7 +32,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::NotADirectory(_) => None,
+            Error::NotADirectory(_) | Error::Yaml { .. } => None,
             Error::Read { source, .. } => Some(source),
         }
     }

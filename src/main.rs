@@ -1,4 +1,5 @@
 mod cli;
+mod compose;
 mod dotenv;
 mod error;
 mod sources;
@@ -62,18 +63,27 @@ fn run(cli: &Cli) -> Result<u8> {
 
 /// What one source says, in the few words a listing has room for.
 fn summarize(source: &Source) -> Result<String> {
-    // Compose keeps its variables inside a service tree that envwire cannot read yet.
     if source.kind == SourceKind::Compose {
-        return Ok("not read yet".to_string());
+        let compose = compose::read(&source.path)?;
+        let variables: usize = compose.services.iter().map(|s| s.environment.len()).sum();
+        return Ok(format!(
+            "{}, {}",
+            count(compose.services.len(), "service"),
+            count(variables, "variable")
+        ));
     }
 
     let doc = dotenv::read(&source.path)?;
-    let mut summary = match doc.entries.len() {
-        1 => "1 variable".to_string(),
-        n => format!("{n} variables"),
-    };
+    let mut summary = count(doc.entries.len(), "variable");
     if !doc.malformed.is_empty() {
         summary.push_str(&format!(", {} unreadable", doc.malformed.len()));
     }
     Ok(summary)
+}
+
+fn count(n: usize, noun: &str) -> String {
+    match n {
+        1 => format!("1 {noun}"),
+        n => format!("{n} {noun}s"),
+    }
 }
