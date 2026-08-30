@@ -1,0 +1,5 @@
+/target
+
+# envwire reads these for a living; it must never carry one home.
+.env
+.env.local
