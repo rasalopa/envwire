@@ -1,4 +1,5 @@
 mod cli;
+mod dotenv;
 mod error;
 mod sources;
 
@@ -8,6 +9,7 @@ use clap::Parser;
 
 use crate::cli::Cli;
 use crate::error::{Error, Result};
+use crate::sources::{Source, SourceKind};
 
 /// Nothing to report.
 const CLEAN: u8 = 0;
@@ -46,9 +48,32 @@ fn run(cli: &Cli) -> Result<u8> {
     println!("{}", target.display());
     for source in &found {
         let name = source.path.strip_prefix(&target).unwrap_or(&source.path);
-        println!("  {:<8} {}", source.kind.label(), name.display());
+        println!(
+            "  {:<8} {:<24} {}",
+            source.kind.label(),
+            name.display(),
+            summarize(source)?
+        );
     }
-    println!("\nFinding these is all envwire does so far. No checks run yet.");
+    println!("\nReading these is all envwire does so far. No checks run yet.");
 
     Ok(CLEAN)
+}
+
+/// What one source says, in the few words a listing has room for.
+fn summarize(source: &Source) -> Result<String> {
+    // Compose keeps its variables inside a service tree that envwire cannot read yet.
+    if source.kind == SourceKind::Compose {
+        return Ok("not read yet".to_string());
+    }
+
+    let doc = dotenv::read(&source.path)?;
+    let mut summary = match doc.entries.len() {
+        1 => "1 variable".to_string(),
+        n => format!("{n} variables"),
+    };
+    if !doc.malformed.is_empty() {
+        summary.push_str(&format!(", {} unreadable", doc.malformed.len()));
+    }
+    Ok(summary)
 }
