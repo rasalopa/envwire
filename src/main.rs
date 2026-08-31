@@ -5,6 +5,7 @@ mod error;
 mod sources;
 mod template;
 
+use std::collections::HashMap;
 use std::fs;
 use std::process::ExitCode;
 
@@ -13,7 +14,7 @@ use clap::Parser;
 use crate::cli::Cli;
 use crate::error::{Error, Result};
 use crate::sources::{Source, SourceKind};
-use crate::template::Template;
+use crate::template::{Template, Value};
 
 /// Nothing to report.
 const CLEAN: u8 = 0;
@@ -95,14 +96,21 @@ fn report_references(found: &[Source]) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "\n{} names {} variable{}:",
-        compose.path.display(),
-        distinct.len(),
-        if distinct.len() == 1 { "" } else { "s" }
-    );
+    let mut known: HashMap<String, Value> = HashMap::new();
+    if let Some(env) = found
+        .iter()
+        .find(|s| s.path.file_name().and_then(|n| n.to_str()) == Some(".env"))
+    {
+        for entry in dotenv::read(&env.path)?.entries {
+            known.insert(entry.key, Value::stated(&entry.value));
+        }
+    }
+
+    println!("\n{} asks for:", compose.path.display());
     for name in &distinct {
-        println!("  {name}");
+        let resolved = Template::parse(&format!("${{{name}}}")).resolve(&|n| known.get(n).cloned());
+        // Never the value itself -- see `Value::disclosure`.
+        println!("  {name:<32} {}", resolved.disclosure());
     }
     Ok(())
 }

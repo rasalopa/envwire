@@ -1,3 +1,54 @@
+/// What a variable will hold, as far as envwire can honestly say.
+///
+/// The third state is the absence of a key from a map. Keeping it out of the enum is
+/// what stops a check reading an unresolved reference as `Literal("")`: an empty
+/// value is a variable the container has, an absent one is a variable it does not,
+/// and `Unknown` is envwire admitting it cannot see the shell that will run
+/// `docker compose up`. Collapse any two of the three and the checks start
+/// describing containers nobody is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Value {
+    Literal(String),
+    Unknown,
+}
+
+impl Value {
+    /// What a line of a `.env`-shaped file amounts to.
+    ///
+    /// A value naming any variable at all is `Unknown` and stays that way. Compose
+    /// does expand `${OTHER}` inside a `.env` value, but only when the value was
+    /// unquoted or double-quoted, and dotenv.rs strips the quotes before this sees
+    /// the text -- so a single-quoted `'${HOST}/x'`, which Docker keeps literal,
+    /// arrives here indistinguishable from a double-quoted one it would expand.
+    /// Guessing buys one resolved value and risks every finding built on it.
+    pub fn stated(text: &str) -> Value {
+        let parsed = Template::parse(text);
+        if parsed.has_refs() {
+            Value::Unknown
+        } else {
+            // Reference-free, so this only collapses `$$` into `$`.
+            parsed.resolve(&|_| None)
+        }
+    }
+
+    /// All envwire will say about a value out loud.
+    ///
+    /// Never the value. This tool reads the file the secrets live in, and
+    /// `envwire check` is built to run in CI, where whatever it prints lands in a
+    /// build log that outlives the run and, on a public repository, is readable by
+    /// anyone. A linter that leaks the credentials it was pointed at is worse than
+    /// no linter. Whether a value is there is the whole of what a reader needs; a
+    /// check that must name a value -- a host, a URL -- says it itself, and answers
+    /// for that choice on its own.
+    pub fn disclosure(&self) -> &'static str {
+        match self {
+            Value::Literal(text) if text.is_empty() => "set, empty",
+            Value::Literal(_) => "set",
+            Value::Unknown => "not set here",
+        }
+    }
+}
+
 /// A value out of a Compose file, split into text and the variables it names.
 ///
 /// Kept as a parse rather than a string because the string lies twice:
@@ -102,6 +153,58 @@ impl Template {
         }
     }
 
+    fn has_refs(&self) -> bool {
+        self.0
+            .iter()
+            .any(|s| matches!(s, Segment::Reference { .. }))
+    }
+
+    /// What this becomes, given a way to look a variable up.
+    ///
+    /// One `Unknown` poisons the whole value. Half a value is not a value:
+    /// `http://${HOST}:5432` with an unknown host must never reach a comparison as
+    /// `http://:5432`.
+    pub fn resolve(&self, lookup: &dyn Fn(&str) -> Option<Value>) -> Value {
+        let mut out = String::new();
+        for segment in &self.0 {
+            let piece = match segment {
+                Segment::Text(text) => Value::Literal(text.clone()),
+                Segment::Reference { name, fallback } => match (fallback, lookup(name)) {
+                    (_, Some(Value::Unknown)) => Value::Unknown,
+
+                    (Fallback::Default { on_empty, value }, Some(Value::Literal(found))) => {
+                        if found.is_empty() && *on_empty {
+                            value.resolve(lookup)
+                        } else {
+                            Value::Literal(found)
+                        }
+                    }
+                    (Fallback::Default { value, .. }, None) => value.resolve(lookup),
+
+                    (Fallback::Alternate { on_empty, value }, Some(Value::Literal(found))) => {
+                        if found.is_empty() && *on_empty {
+                            Value::Literal(String::new())
+                        } else {
+                            value.resolve(lookup)
+                        }
+                    }
+                    // Where a default gives envwire something to say, an alternate
+                    // gives it only emptiness, and "this variable is empty" is not
+                    // worth being wrong about.
+                    (Fallback::Alternate { .. }, None) => Value::Unknown,
+
+                    (Fallback::None, Some(found)) => found,
+                    (Fallback::None, None) => Value::Unknown,
+                },
+            };
+            match piece {
+                Value::Literal(text) => out.push_str(&text),
+                Value::Unknown => return Value::Unknown,
+            }
+        }
+        Value::Literal(out)
+    }
+
     /// Every variable this text names, nested fallbacks included.
     ///
     /// Duplicates are kept: the caller wants one entry per occurrence, because each
@@ -200,6 +303,24 @@ fn leading_name(text: &str) -> usize {
 mod tests {
     use super::*;
 
+    /// Resolve against a small table, the way the project `.env` will.
+    fn with(pairs: &[(&str, &str)], text: &str) -> Value {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        Template::parse(text).resolve(&|name| {
+            owned
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| Value::Literal(v.clone()))
+        })
+    }
+
+    fn literal(text: &str) -> Value {
+        Value::Literal(text.to_string())
+    }
+
     fn names_of(text: &str) -> Vec<String> {
         let mut out = Vec::new();
         Template::parse(text).names(&mut out);
@@ -207,69 +328,145 @@ mod tests {
     }
 
     #[test]
-    fn text_with_no_dollar_names_nothing() {
-        assert!(names_of("postgres://db:5432/app").is_empty());
-        assert!(names_of("").is_empty());
+    fn text_with_no_dollar_is_carried_through() {
+        assert_eq!(
+            with(&[], "postgres://db:5432/app"),
+            literal("postgres://db:5432/app")
+        );
+        assert!(names_of("plain text").is_empty());
     }
 
     #[test]
-    fn both_reference_spellings_are_read() {
-        assert_eq!(names_of("${HOST}"), ["HOST"]);
-        assert_eq!(names_of("$HOST"), ["HOST"]);
-        assert_eq!(names_of("http://${HOST}:6379"), ["HOST"]);
+    fn a_reference_becomes_the_value_it_names() {
+        assert_eq!(with(&[("HOST", "redis")], "${HOST}"), literal("redis"));
+        assert_eq!(with(&[("HOST", "redis")], "$HOST"), literal("redis"));
+    }
+
+    #[test]
+    fn a_reference_glued_to_text_keeps_both() {
+        assert_eq!(
+            with(&[("HOST", "redis")], "http://${HOST}:6379"),
+            literal("http://redis:6379")
+        );
+    }
+
+    #[test]
+    fn an_unknown_reference_poisons_the_whole_value() {
+        // Never "http://:6379": half a value would be compared as if it were one.
+        assert_eq!(with(&[], "http://${HOST}:6379"), Value::Unknown);
+    }
+
+    #[test]
+    fn a_default_is_used_only_when_there_is_nothing_to_use() {
+        assert_eq!(with(&[], "${PORT:-5432}"), literal("5432"));
+        assert_eq!(with(&[("PORT", "6000")], "${PORT:-5432}"), literal("6000"));
+    }
+
+    #[test]
+    fn the_two_default_forms_disagree_about_empty() {
+        assert_eq!(with(&[("P", "")], "${P:-fallback}"), literal("fallback"));
+        assert_eq!(with(&[("P", "")], "${P-fallback}"), literal(""));
+    }
+
+    #[test]
+    fn an_alternate_replaces_a_value_that_is_there() {
+        assert_eq!(with(&[("FLAG", "1")], "${FLAG:+on}"), literal("on"));
+        assert_eq!(with(&[("FLAG", "")], "${FLAG:+on}"), literal(""));
+        assert_eq!(with(&[("FLAG", "")], "${FLAG+on}"), literal("on"));
+        // Absent: an alternate offers only emptiness, not worth being wrong about.
+        assert_eq!(with(&[], "${FLAG:+on}"), Value::Unknown);
+    }
+
+    #[test]
+    fn the_error_forms_have_nothing_to_fall_back_on() {
+        assert_eq!(with(&[("A", "x")], "${A:?required}"), literal("x"));
+        assert_eq!(with(&[], "${A:?required}"), Value::Unknown);
+        assert_eq!(with(&[], "${A?required}"), Value::Unknown);
     }
 
     #[test]
     fn an_operator_is_not_swallowed_into_the_name() {
-        // Read as one shape, each of these asks for a variable whose name carries
-        // the operator -- "PORT:-5432" -- and is then reported missing from a `.env`
-        // that was never meant to carry it.
+        // Read as one shape this asks for a variable named "PORT:-5432".
         assert_eq!(names_of("${PORT:-5432}"), ["PORT"]);
-        assert_eq!(names_of("${PORT-5432}"), ["PORT"]);
-        assert_eq!(names_of("${FLAG:+on}"), ["FLAG"]);
-        assert_eq!(names_of("${FLAG+on}"), ["FLAG"]);
+        assert_eq!(names_of("${A-x}"), ["A"]);
         assert_eq!(names_of("${A:?why}"), ["A"]);
-        assert_eq!(names_of("${A?why}"), ["A"]);
     }
 
     #[test]
-    fn a_nested_fallback_is_counted_too() {
+    fn a_nested_default_is_resolved_and_counted() {
+        assert_eq!(with(&[("B", "second")], "${A:-${B}}"), literal("second"));
+        assert_eq!(with(&[], "${A:-${B:-third}}"), literal("third"));
         assert_eq!(names_of("${A:-${B}}"), ["A", "B"]);
-        assert_eq!(names_of("${A:-${B:-${C}}}"), ["A", "B", "C"]);
     }
 
     #[test]
-    fn a_doubled_dollar_is_never_a_reference() {
-        assert!(names_of("pa$$word").is_empty());
+    fn a_doubled_dollar_is_one_dollar_and_never_a_reference() {
+        assert_eq!(with(&[("VAR", "x")], "pa$$word"), literal("pa$word"));
+        assert_eq!(with(&[("VAR", "x")], "$${VAR}"), literal("${VAR}"));
         assert!(names_of("$${VAR}").is_empty());
     }
 
     #[test]
-    fn a_shape_we_do_not_recognise_names_nothing() {
-        // Inventing a variable out of a shape we cannot read is how a linter starts
-        // reporting names nobody wrote.
-        for text in [
-            "${unclosed",
-            "${}",
-            "${1BAD}",
-            "${A%weird}",
-            "100$",
-            "$ ",
-            "$",
-        ] {
-            assert!(names_of(text).is_empty(), "{text:?} should name nothing");
+    fn a_shape_we_do_not_recognise_stays_text() {
+        for text in ["${unclosed", "${}", "${1BAD}", "${A%weird}", "100$"] {
+            assert_eq!(
+                with(&[], text),
+                literal(text),
+                "{text:?} should stay literal"
+            );
+            assert!(names_of(text).is_empty(), "{text:?} names nothing");
         }
     }
 
     #[test]
     fn every_occurrence_is_counted_once_each() {
-        // One entry per occurrence: each sits on a line worth pointing at.
         assert_eq!(names_of("${A}-${B}-${A}"), ["A", "B", "A"]);
     }
 
     #[test]
-    fn a_reference_survives_text_on_both_sides() {
-        assert_eq!(names_of("prefix-$A-suffix"), ["A"]);
-        assert_eq!(names_of("${A}${B}"), ["A", "B"]);
+    fn a_value_that_names_nothing_is_stated_as_written() {
+        assert_eq!(
+            Value::stated("postgres://db/app"),
+            literal("postgres://db/app")
+        );
+        assert_eq!(Value::stated(""), literal(""));
+        assert_eq!(Value::stated("pa$$word"), literal("pa$word"));
+    }
+
+    #[test]
+    fn a_value_that_names_a_variable_is_not_stated_at_all() {
+        // dotenv.rs has already dropped the quotes, so there is no way to tell a
+        // literal single-quoted value from a double-quoted one Docker expands.
+        assert_eq!(Value::stated("${HOST}/x"), Value::Unknown);
+        assert_eq!(Value::stated("$HOST"), Value::Unknown);
+    }
+
+    #[test]
+    fn nothing_a_value_holds_is_ever_disclosed() {
+        // The rule this pins: envwire reads the file the secrets live in, and its
+        // CI mode prints into build logs. If this test starts failing because a
+        // value leaked into the wording, that is the bug, not the test.
+        let secrets = [
+            "hunter2",
+            "sk-live-9f3a2b",
+            "postgres://user:pa55@db/app",
+            "-----BEGIN PRIVATE KEY-----",
+        ];
+        for secret in secrets {
+            let said = Value::Literal(secret.to_string()).disclosure();
+            assert!(!said.contains(secret), "{said:?} disclosed {secret:?}");
+            assert_eq!(said, "set");
+        }
+        assert_eq!(Value::Literal(String::new()).disclosure(), "set, empty");
+        assert_eq!(Value::Unknown.disclosure(), "not set here");
+    }
+
+    #[test]
+    fn a_lookup_that_answers_unknown_is_believed() {
+        let unknown = Template::parse("${A}").resolve(&|_| Some(Value::Unknown));
+        assert_eq!(unknown, Value::Unknown);
+        // Even behind a default: the variable is set, we just cannot read it.
+        let behind = Template::parse("${A:-x}").resolve(&|_| Some(Value::Unknown));
+        assert_eq!(behind, Value::Unknown);
     }
 }
