@@ -3,7 +3,9 @@ mod compose;
 mod dotenv;
 mod error;
 mod sources;
+mod template;
 
+use std::fs;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -11,6 +13,7 @@ use clap::Parser;
 use crate::cli::Cli;
 use crate::error::{Error, Result};
 use crate::sources::{Source, SourceKind};
+use crate::template::Template;
 
 /// Nothing to report.
 const CLEAN: u8 = 0;
@@ -56,9 +59,52 @@ fn run(cli: &Cli) -> Result<u8> {
             summarize(source)?
         );
     }
+    report_references(&found)?;
     println!("\nReading these is all envwire does so far. No checks run yet.");
 
     Ok(CLEAN)
+}
+
+/// What the Compose file asks the project `.env` for.
+///
+/// Only the root `.env` takes part in interpolation -- a service's `env_file:` never
+/// does, not even when it names `.env` itself -- so this is the whole of what Compose
+/// has to work with before a container starts.
+fn report_references(found: &[Source]) -> Result<()> {
+    let Some(compose) = found.iter().find(|s| s.kind == SourceKind::Compose) else {
+        return Ok(());
+    };
+    let raw = fs::read_to_string(&compose.path).map_err(|source| Error::Read {
+        path: compose.path.clone(),
+        source,
+    })?;
+
+    // Every reference in the raw text, not just the ones under `environment:`:
+    // `image: app:${TAG}` names a variable too, and the parsed model never sees it.
+    let mut names = Vec::new();
+    for line in raw.lines() {
+        Template::parse(line).names(&mut names);
+    }
+    let mut distinct: Vec<String> = Vec::new();
+    for name in names {
+        if !distinct.contains(&name) {
+            distinct.push(name);
+        }
+    }
+    if distinct.is_empty() {
+        return Ok(());
+    }
+
+    println!(
+        "\n{} names {} variable{}:",
+        compose.path.display(),
+        distinct.len(),
+        if distinct.len() == 1 { "" } else { "s" }
+    );
+    for name in &distinct {
+        println!("  {name}");
+    }
+    Ok(())
 }
 
 /// What one source says, in the few words a listing has room for.
