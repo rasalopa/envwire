@@ -2,6 +2,7 @@ mod cli;
 mod compose;
 mod dotenv;
 mod error;
+mod model;
 mod sources;
 mod template;
 
@@ -13,6 +14,7 @@ use clap::Parser;
 
 use crate::cli::Cli;
 use crate::error::{Error, Result};
+use crate::model::Project;
 use crate::sources::{Source, SourceKind};
 use crate::template::{Template, Value};
 
@@ -49,6 +51,8 @@ fn run(cli: &Cli) -> Result<u8> {
         return Ok(CLEAN);
     }
 
+    let project = model::read(&found)?;
+
     // The heading carries the directory, so each line only needs the name under it.
     println!("{}", target.display());
     for source in &found {
@@ -57,7 +61,7 @@ fn run(cli: &Cli) -> Result<u8> {
             "  {:<8} {:<24} {}",
             source.kind.label(),
             name.display(),
-            summarize(source)?
+            summarize(source, &project)?
         );
     }
     report_references(&found)?;
@@ -116,7 +120,7 @@ fn report_references(found: &[Source]) -> Result<()> {
 }
 
 /// What one source says, in the few words a listing has room for.
-fn summarize(source: &Source) -> Result<String> {
+fn summarize(source: &Source, project: &Project) -> Result<String> {
     if source.kind == SourceKind::Compose {
         let compose = compose::read(&source.path)?;
         let variables: usize = compose.services.iter().map(|s| s.environment.len()).sum();
@@ -127,10 +131,12 @@ fn summarize(source: &Source) -> Result<String> {
         ));
     }
 
-    let doc = dotenv::read(&source.path)?;
-    let mut summary = count(doc.entries.len(), "variable");
-    if !doc.malformed.is_empty() {
-        summary.push_str(&format!(", {} unreadable", doc.malformed.len()));
+    let Some(file) = project.files.iter().find(|f| f.path == source.path) else {
+        return Ok(String::new());
+    };
+    let mut summary = count(file.settings.len(), "variable");
+    if !file.malformed.is_empty() {
+        summary.push_str(&format!(", {} unreadable", file.malformed.len()));
     }
     Ok(summary)
 }

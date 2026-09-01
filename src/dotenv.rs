@@ -98,7 +98,7 @@ pub fn parse(text: &str) -> Document {
 }
 
 /// Whether `name` can be an environment variable name.
-fn is_name(name: &str) -> bool {
+pub(crate) fn is_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
