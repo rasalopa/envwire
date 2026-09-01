@@ -6,8 +6,6 @@ mod model;
 mod sources;
 mod template;
 
-use std::collections::HashMap;
-use std::fs;
 use std::process::ExitCode;
 
 use clap::Parser;
@@ -16,7 +14,6 @@ use crate::cli::Cli;
 use crate::error::{Error, Result};
 use crate::model::Project;
 use crate::sources::{Source, SourceKind};
-use crate::template::{Template, Value};
 
 /// Nothing to report.
 const CLEAN: u8 = 0;
@@ -64,7 +61,7 @@ fn run(cli: &Cli) -> Result<u8> {
             summarize(source, &project)?
         );
     }
-    report_references(&found)?;
+    report_references(&project);
     println!("\nReading these is all envwire does so far. No checks run yet.");
 
     Ok(CLEAN)
@@ -72,51 +69,34 @@ fn run(cli: &Cli) -> Result<u8> {
 
 /// What the Compose file asks the project `.env` for.
 ///
-/// Only the root `.env` takes part in interpolation -- a service's `env_file:` never
-/// does, not even when it names `.env` itself -- so this is the whole of what Compose
-/// has to work with before a container starts.
-fn report_references(found: &[Source]) -> Result<()> {
-    let Some(compose) = found.iter().find(|s| s.kind == SourceKind::Compose) else {
-        return Ok(());
+/// Only the root `.env` answers -- a service's `env_file:` never takes part in
+/// interpolation -- so this is the whole of what Compose has to work with before a
+/// container starts.
+fn report_references(project: &Project) {
+    let Some(compose) = &project.compose else {
+        return;
     };
-    let raw = fs::read_to_string(&compose.path).map_err(|source| Error::Read {
-        path: compose.path.clone(),
-        source,
-    })?;
 
-    // Every reference in the raw text, not just the ones under `environment:`:
-    // `image: app:${TAG}` names a variable too, and the parsed model never sees it.
-    let mut names = Vec::new();
-    for line in raw.lines() {
-        Template::parse(line).names(&mut names);
-    }
-    let mut distinct: Vec<String> = Vec::new();
-    for name in names {
-        if !distinct.contains(&name) {
-            distinct.push(name);
+    // One line per variable, at the first place that names it.
+    let mut first: Vec<&crate::model::Reference> = Vec::new();
+    for reference in &project.references {
+        if !first.iter().any(|seen| seen.name == reference.name) {
+            first.push(reference);
         }
     }
-    if distinct.is_empty() {
-        return Ok(());
+    if first.is_empty() {
+        return;
     }
 
-    let mut known: HashMap<String, Value> = HashMap::new();
-    if let Some(env) = found
-        .iter()
-        .find(|s| s.path.file_name().and_then(|n| n.to_str()) == Some(".env"))
-    {
-        for entry in dotenv::read(&env.path)?.entries {
-            known.insert(entry.key, Value::stated(&entry.value));
-        }
-    }
-
-    println!("\n{} asks for:", compose.path.display());
-    for name in &distinct {
-        let resolved = Template::parse(&format!("${{{name}}}")).resolve(&|n| known.get(n).cloned());
+    println!("\n{} asks for:", compose.display());
+    for reference in first {
         // Never the value itself -- see `Value::disclosure`.
-        println!("  {name:<32} {}", resolved.disclosure());
+        let answer = match project.interpolation.get(&reference.name) {
+            Some(bound) => format!("{}, at {}", bound.value.disclosure(), bound.origin),
+            None => "not in .env".to_string(),
+        };
+        println!("  {:<30} {answer}", reference.name);
     }
-    Ok(())
 }
 
 /// What one source says, in the few words a listing has room for.

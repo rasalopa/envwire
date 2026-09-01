@@ -1,9 +1,37 @@
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::dotenv::{self, Malformed};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::sources::{Source, SourceKind};
-use crate::template::Value;
+use crate::template::{Template, Value};
+
+/// Where something is written.
+///
+/// A `.env` finding points at a line, because a reader can open it there. A Compose
+/// finding cannot: yaml-rust2 exposes no position markers, so the service name is as
+/// precise as it is honest to be. That second shape arrives with the services.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Origin {
+    Line { path: PathBuf, line: usize },
+}
+
+impl fmt::Display for Origin {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Origin::Line { path, line } => write!(f, "{}:{line}", path.display()),
+        }
+    }
+}
+
+/// A value and where to go to change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bound {
+    pub value: Value,
+    pub origin: Origin,
+}
 
 /// One line of a `.env`-shaped file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,10 +54,49 @@ pub struct EnvFile {
     pub malformed: Vec<Malformed>,
 }
 
+/// The variables Compose holds while expanding `${...}` in the YAML text.
+///
+/// Only the project `.env` goes in here. A service's `env_file:` never takes part in
+/// interpolation, not even when it names `.env` itself -- two projects, one with
+/// `env_file: .env` and one without, interpolate identically, and only what lands in
+/// the container differs. `.env.local` is a framework convention Compose has never
+/// opened; both facts were checked against `docker compose config`, not read.
+///
+/// The map is private and there is deliberately no way to iterate it. A list of
+/// "the variables this project has" is what makes every `.env` key look like it
+/// belongs in every container, and that one shortcut would produce more wrong
+/// findings than every other mistake here put together.
+///
+/// Nothing from the process environment is ever read: a linter whose findings change
+/// with the shell that ran it cannot be trusted in CI.
+#[derive(Debug, Default)]
+pub struct Interpolation {
+    values: BTreeMap<String, Bound>,
+}
+
+impl Interpolation {
+    pub fn get(&self, name: &str) -> Option<&Bound> {
+        self.values.get(name)
+    }
+}
+
+/// A `$VAR` or `${...}` somewhere in the Compose file's text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reference {
+    pub name: String,
+    pub origin: Origin,
+}
+
 /// Everything the checks are allowed to reason from.
 #[derive(Debug)]
 pub struct Project {
     pub files: Vec<EnvFile>,
+    pub interpolation: Interpolation,
+    /// The Compose file, when there is one. A question about what containers receive
+    /// has no answer in a project without it.
+    pub compose: Option<PathBuf>,
+    /// Every reference in the raw Compose text, with its line. Duplicates kept.
+    pub references: Vec<Reference>,
 }
 
 /// Read a project into the one shape every check reasons from.
@@ -52,7 +119,30 @@ pub fn read(sources: &[Source]) -> Result<Project> {
             malformed,
         });
     }
-    Ok(Project { files })
+
+    let interpolation = interpolation_of(&files);
+
+    let compose = sources
+        .iter()
+        .find(|s| s.kind == SourceKind::Compose)
+        .map(|s| s.path.clone());
+    let references = match &compose {
+        Some(path) => {
+            let raw = fs::read_to_string(path).map_err(|source| Error::Read {
+                path: path.clone(),
+                source,
+            })?;
+            scan(&raw, path)
+        }
+        None => Vec::new(),
+    };
+
+    Ok(Project {
+        files,
+        interpolation,
+        compose,
+        references,
+    })
 }
 
 /// What one file states, with the lines Docker would still accept recovered.
@@ -119,6 +209,59 @@ fn colon_form(text: &str) -> Option<Setting> {
         value: Some(Value::stated(&entry.value)),
         line: 0,
     })
+}
+
+/// Build what Compose would expand `${...}` from.
+fn interpolation_of(files: &[EnvFile]) -> Interpolation {
+    let mut interpolation = Interpolation::default();
+    let Some(file) = files
+        .iter()
+        .find(|f| f.path.file_name().and_then(|n| n.to_str()) == Some(".env"))
+    else {
+        return interpolation;
+    };
+
+    for setting in &file.settings {
+        // A pass-through request defines nothing, so it cannot answer a `${...}`.
+        let Some(value) = &setting.value else {
+            continue;
+        };
+        // Last wins, the way a shell sourcing the file would end up.
+        interpolation.values.insert(
+            setting.key.clone(),
+            Bound {
+                value: value.clone(),
+                origin: Origin::Line {
+                    path: file.path.clone(),
+                    line: setting.line,
+                },
+            },
+        );
+    }
+    interpolation
+}
+
+/// Every variable the raw Compose text names, with the line that names it.
+///
+/// Deliberately separate from the parsed model: compose.rs captures only
+/// `environment` and `env_file`, so `image: app:${TAG}` and `ports: ["${PORT}:80"]`
+/// never reach it, and a usage check built on the model alone would call them unused.
+fn scan(raw: &str, path: &Path) -> Vec<Reference> {
+    let mut references = Vec::new();
+    for (index, line) in raw.lines().enumerate() {
+        let mut names = Vec::new();
+        Template::parse(line).names(&mut names);
+        for name in names {
+            references.push(Reference {
+                name,
+                origin: Origin::Line {
+                    path: path.to_path_buf(),
+                    line: index + 1,
+                },
+            });
+        }
+    }
+    references
 }
 
 #[cfg(test)]
@@ -193,7 +336,8 @@ mod tests {
                 ("GOOD".to_string(), literal("yes")),
             ]
         );
-        assert!(project.files[0].malformed.is_empty());
+        let file = &project.files[0];
+        assert!(file.malformed.is_empty(), "{:?}", file.malformed);
     }
 
     #[test]
@@ -226,25 +370,80 @@ mod tests {
     }
 
     #[test]
-    fn both_halves_of_a_repeated_key_survive_the_read() {
-        // Which assignment wins is a finding; collapsing them here would throw away
-        // the evidence that there were two.
-        let (_dir, project) = project(&[(".env", "KEY=first\nKEY=second\n")]);
+    fn only_the_project_env_answers_an_interpolation() {
+        let (_dir, project) = project(&[
+            (".env", "SHARED=from-env\n"),
+            (".env.local", "LOCAL_ONLY=x\nSHARED=from-local\n"),
+            (".env.example", "EXAMPLE_ONLY=y\n"),
+        ]);
         assert_eq!(
-            settings(&project, ".env"),
-            [
-                ("KEY".to_string(), literal("first")),
-                ("KEY".to_string(), literal("second"))
-            ]
+            project.interpolation.get("SHARED").map(|b| b.value.clone()),
+            Some(Value::Literal("from-env".to_string()))
+        );
+        // Compose has never opened either of these.
+        assert!(project.interpolation.get("LOCAL_ONLY").is_none());
+        assert!(project.interpolation.get("EXAMPLE_ONLY").is_none());
+    }
+
+    #[test]
+    fn the_last_assignment_is_the_one_a_shell_would_keep() {
+        let (_dir, project) = project(&[(".env", "KEY=first\nKEY=second\n")]);
+        let bound = project.interpolation.get("KEY").unwrap();
+        assert_eq!(bound.value, Value::Literal("second".to_string()));
+        assert!(matches!(bound.origin, Origin::Line { line: 2, .. }));
+    }
+
+    #[test]
+    fn a_pass_through_answers_no_interpolation() {
+        let (_dir, project) = project(&[(".env", "BARE\n")]);
+        assert!(project.interpolation.get("BARE").is_none());
+    }
+
+    #[test]
+    fn an_unreadable_value_is_carried_as_unknown_not_dropped() {
+        // Dropping it would let a reference to it resolve to nothing at all, which
+        // reads as "unset" when the truth is "set to something we cannot see".
+        let (_dir, project) = project(&[(".env", "A=${B}\n")]);
+        assert_eq!(
+            project.interpolation.get("A").map(|b| b.value.clone()),
+            Some(Value::Unknown)
         );
     }
 
     #[test]
-    fn a_compose_file_is_not_read_as_an_env_file() {
-        let (_dir, project) = project(&[
-            (".env", "A=1\n"),
-            ("docker-compose.yml", "services:\n  api:\n    image: app\n"),
-        ]);
-        assert_eq!(project.files.len(), 1);
+    fn references_are_found_wherever_they_sit_in_the_file() {
+        let (_dir, project) = project(&[(
+            "docker-compose.yml",
+            "services:\n  api:\n    image: app:${TAG}\n    ports:\n      - \"${PORT}:80\"\n    environment:\n      HOST: ${DB_HOST:-db}\n",
+        )]);
+        let found: Vec<(&str, &Origin)> = project
+            .references
+            .iter()
+            .map(|r| (r.name.as_str(), &r.origin))
+            .collect();
+        // image: and ports: are invisible to the parsed model, which is the whole
+        // reason the scan reads the raw text instead.
+        assert_eq!(
+            found.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            ["TAG", "PORT", "DB_HOST"]
+        );
+        assert!(matches!(found[0].1, Origin::Line { line: 3, .. }));
+        assert!(matches!(found[2].1, Origin::Line { line: 7, .. }));
+    }
+
+    #[test]
+    fn a_project_without_compose_has_nothing_to_scan() {
+        let (_dir, project) = project(&[(".env", "A=1\n")]);
+        assert!(project.compose.is_none());
+        assert!(project.references.is_empty());
+    }
+
+    #[test]
+    fn an_origin_says_where_to_look() {
+        let origin = Origin::Line {
+            path: PathBuf::from("/srv/app/.env"),
+            line: 12,
+        };
+        assert_eq!(origin.to_string(), "/srv/app/.env:12");
     }
 }
