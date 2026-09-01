@@ -205,6 +205,18 @@ impl Template {
         Value::Literal(out)
     }
 
+    /// The variable named, when this value is exactly one reference and nothing else.
+    ///
+    /// That is the only case where a single `.env` line is worth pointing a reader at.
+    /// A value glued together from text and several references has no one line behind
+    /// it, and naming any of them would send the reader somewhere the value is not.
+    pub fn sole_reference(&self) -> Option<&str> {
+        match self.0.as_slice() {
+            [Segment::Reference { name, .. }] => Some(name),
+            _ => None,
+        }
+    }
+
     /// Every variable this text names, nested fallbacks included.
     ///
     /// Duplicates are kept: the caller wants one entry per occurrence, because each

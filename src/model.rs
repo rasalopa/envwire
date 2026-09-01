@@ -17,12 +17,14 @@ use crate::template::{Template, Value};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     Line { path: PathBuf, line: usize },
+    Inline { service: String },
 }
 
 impl fmt::Display for Origin {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Origin::Line { path, line } => write!(f, "{}:{line}", path.display()),
+            Origin::Inline { service } => write!(f, "service {service}"),
         }
     }
 }
@@ -33,6 +35,14 @@ pub struct Bound {
     pub value: Value,
     /// The place that decided this key.
     pub origin: Origin,
+    /// Where the text was typed, when `origin` merely asked for it.
+    ///
+    /// `HOST: ${DB_HOST}` is decided by the service, but `localhost` was typed at
+    /// `.env:3`. Without this a report sends a reader to a Compose line that does not
+    /// contain the value it complains about, which is the fastest way to lose them.
+    /// Set only when the whole value was one reference: a value glued from text and
+    /// several references has no single line worth naming.
+    pub via: Option<Origin>,
 }
 
 /// One line of a `.env`-shaped file.
@@ -91,12 +101,13 @@ pub struct Reference {
 
 /// Which layer of a service's environment set a key.
 ///
-/// Ordered on purpose, and the derived `Ord` is the precedence rule itself: a later
-/// `env_file` beats an earlier one. Confirmed against `docker compose config`, per
-/// key rather than per file. The layer `environment:` sets arrives with it.
+/// Ordered on purpose, and the derived `Ord` is the whole precedence rule:
+/// a later `env_file` beats an earlier one, and `environment:` beats every file.
+/// Confirmed against `docker compose config`, per key rather than per file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Layer {
     EnvFile(usize),
+    Inline,
 }
 
 /// Something about a service envwire could not read, and how far up it reaches.
@@ -111,6 +122,9 @@ pub enum Missing {
     /// An `env_file:` that is not on disk. Its contents are a guess, and a guess must
     /// silence a finding rather than be treated as an empty file.
     UnreadFile(PathBuf),
+    /// `- ${VAR}=value`. The list form interpolates keys, so envwire does not know
+    /// what this service is handed, nor what it overrides.
+    DynamicKey(String),
 }
 
 /// One variable a service's containers would start with.
@@ -140,9 +154,11 @@ pub struct ServiceEnv {
 impl ServiceEnv {
     /// Whether anything envwire could not read could still overrule `var`.
     ///
-    /// Exact rather than conservative: a value from a later env file survives a gap
-    /// in an earlier one, because a later file wins. Only what could still overrule
-    /// this key silences it.
+    /// Exact rather than conservative: a value that won at `Inline` survives any
+    /// unread env file, because nothing an env file says beats `environment:`, and a
+    /// value from a later env file survives a gap in an earlier one. A dynamic key
+    /// sits at `Inline`, which no layer exceeds, so it quiets the whole service --
+    /// which is right, since it could override anything.
     pub fn settled(&self, var: &Var) -> bool {
         self.gaps.iter().all(|gap| gap.layer < var.layer)
     }
@@ -200,7 +216,7 @@ pub fn read(sources: &[Source]) -> Result<Project> {
             let services = parsed
                 .services
                 .iter()
-                .map(|service| fold(service, path, &mut cache))
+                .map(|service| fold(service, path, &interpolation, &mut cache))
                 .collect();
             (scan(&raw, path), services)
         }
@@ -223,6 +239,7 @@ pub fn read(sources: &[Source]) -> Result<Project> {
 fn fold(
     service: &compose::Service,
     compose_path: &Path,
+    interpolation: &Interpolation,
     cache: &mut HashMap<PathBuf, Vec<Setting>>,
 ) -> ServiceEnv {
     let mut env = ServiceEnv {
@@ -273,10 +290,53 @@ fn fold(
                         path: path.clone(),
                         line: setting.line,
                     },
+                    via: None,
                 },
                 layer,
             );
         }
+    }
+
+    for assignment in &service.environment {
+        // Interpolation never applies to a mapping key, so a key envwire cannot name
+        // is one it must not report on.
+        if !dotenv::is_name(&assignment.key) {
+            env.gaps.push(Gap {
+                layer: Layer::Inline,
+                what: Missing::DynamicKey(assignment.key.clone()),
+            });
+            continue;
+        }
+
+        let bound = match &assignment.value {
+            Some(text) => {
+                let template = Template::parse(text);
+                Bound {
+                    value: template
+                        .resolve(&|name| interpolation.get(name).map(|bound| bound.value.clone())),
+                    origin: Origin::Inline {
+                        service: service.name.clone(),
+                    },
+                    via: template
+                        .sole_reference()
+                        .and_then(|name| interpolation.get(name))
+                        .map(|bound| bound.origin.clone()),
+                }
+            }
+            // A bare `- KEY` is a use, never a definition: the service asks for
+            // whatever is around, and what is around is the project `.env`.
+            None => {
+                let found = interpolation.get(&assignment.key);
+                Bound {
+                    value: found.map_or(Value::Unknown, |bound| bound.value.clone()),
+                    origin: Origin::Inline {
+                        service: service.name.clone(),
+                    },
+                    via: found.map(|bound| bound.origin.clone()),
+                }
+            }
+        };
+        set(&mut env.vars, assignment.key.clone(), bound, Layer::Inline);
     }
 
     env
@@ -383,6 +443,7 @@ fn interpolation_of(files: &[EnvFile]) -> Interpolation {
                     path: file.path.clone(),
                     line: setting.line,
                 },
+                via: None,
             },
         );
     }
@@ -459,26 +520,30 @@ mod tests {
         env.vars.iter().find(|v| v.key == key).expect("key was set")
     }
 
+    fn value(env: &ServiceEnv, key: &str) -> Value {
+        var(env, key).bound.value.clone()
+    }
+
     #[test]
-    fn an_env_file_becomes_the_service_environment() {
+    fn environment_beats_every_env_file() {
+        // Verified against `docker compose config`: per key, not per file.
         let (_dir, project) = project(&[
-            ("svc.env", "HOST=db\nPORT=5432\n"),
+            ("svc.env", "SHARED=from-file\nONLY_FILE=kept\n"),
             (
                 "docker-compose.yml",
-                "services:\n  api:\n    env_file: svc.env\n",
+                "services:\n  api:\n    env_file: svc.env\n    environment:\n      SHARED: from-inline\n",
             ),
         ]);
         let api = service(&project, "api");
-        let keys: Vec<&str> = api.vars.iter().map(|v| v.key.as_str()).collect();
-        assert_eq!(keys, ["HOST", "PORT"]);
-        assert_eq!(var(api, "HOST").bound.value, Value::Literal("db".into()));
+        assert_eq!(value(api, "SHARED"), Value::Literal("from-inline".into()));
+        assert_eq!(value(api, "ONLY_FILE"), Value::Literal("kept".into()));
+        assert_eq!(var(api, "SHARED").layer, Layer::Inline);
     }
 
     #[test]
     fn a_later_env_file_beats_an_earlier_one() {
-        // Verified against `docker compose config`: per key, in the order written.
         let (_dir, project) = project(&[
-            ("a.env", "K=first\nONLY_A=kept\n"),
+            ("a.env", "K=first\n"),
             ("b.env", "K=second\n"),
             (
                 "docker-compose.yml",
@@ -486,37 +551,84 @@ mod tests {
             ),
         ]);
         let api = service(&project, "api");
-        assert_eq!(var(api, "K").bound.value, Value::Literal("second".into()));
+        assert_eq!(value(api, "K"), Value::Literal("second".into()));
         assert_eq!(var(api, "K").layer, Layer::EnvFile(1));
-        assert_eq!(
-            var(api, "ONLY_A").bound.value,
-            Value::Literal("kept".into())
-        );
     }
 
     #[test]
-    fn keys_keep_the_order_they_were_first_set_in() {
+    fn a_value_is_resolved_against_the_project_env() {
+        // The whole reason `${REDIS_HOST}` must never look like drift: it *is* the
+        // .env value, so equality holds by construction.
         let (_dir, project) = project(&[
-            ("a.env", "FIRST=1\nSECOND=2\n"),
-            ("b.env", "FIRST=overridden\nTHIRD=3\n"),
+            (".env", "REDIS_HOST=redis\n"),
             (
                 "docker-compose.yml",
-                "services:\n  api:\n    env_file:\n      - a.env\n      - b.env\n",
+                "services:\n  api:\n    environment:\n      REDIS_HOST: ${REDIS_HOST}\n",
             ),
         ]);
-        let keys: Vec<&str> = service(&project, "api")
-            .vars
-            .iter()
-            .map(|v| v.key.as_str())
-            .collect();
-        assert_eq!(keys, ["FIRST", "SECOND", "THIRD"]);
+        let api = service(&project, "api");
+        assert_eq!(value(api, "REDIS_HOST"), Value::Literal("redis".into()));
+    }
+
+    #[test]
+    fn a_lone_reference_carries_the_line_its_text_was_typed_on() {
+        let (_dir, project) = project(&[
+            (".env", "# a note\nDB_HOST=localhost\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    environment:\n      DB_HOST: ${DB_HOST}\n",
+            ),
+        ]);
+        let bound = &var(service(&project, "api"), "DB_HOST").bound;
+        // The service decided it, but a reader must be sent where the text is.
+        assert!(matches!(bound.origin, Origin::Inline { .. }));
+        assert!(matches!(bound.via, Some(Origin::Line { line: 2, .. })));
+    }
+
+    #[test]
+    fn a_value_glued_from_parts_points_at_no_single_line() {
+        let (_dir, project) = project(&[
+            (".env", "HOST=db\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    environment:\n      URL: http://${HOST}:5432\n",
+            ),
+        ]);
+        let bound = &var(service(&project, "api"), "URL").bound;
+        assert_eq!(bound.value, Value::Literal("http://db:5432".into()));
+        assert!(bound.via.is_none());
+    }
+
+    #[test]
+    fn a_bare_key_asks_the_project_env_and_says_where_it_answered() {
+        // Verified against `docker compose config`: a bare name really does pick the
+        // .env value up, so the flagship check may fire on it.
+        let (_dir, project) = project(&[
+            (".env", "DB_HOST=localhost\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    environment:\n      - DB_HOST\n",
+            ),
+        ]);
+        let bound = &var(service(&project, "api"), "DB_HOST").bound;
+        assert_eq!(bound.value, Value::Literal("localhost".into()));
+        assert!(matches!(bound.via, Some(Origin::Line { line: 1, .. })));
+    }
+
+    #[test]
+    fn a_bare_key_nothing_answers_is_unknown_not_empty() {
+        let (_dir, project) = project(&[(
+            "docker-compose.yml",
+            "services:\n  api:\n    environment:\n      - NOWHERE\n",
+        )]);
+        assert_eq!(value(service(&project, "api"), "NOWHERE"), Value::Unknown);
     }
 
     #[test]
     fn an_env_file_that_is_not_there_is_a_gap_not_an_empty_file() {
         let (_dir, project) = project(&[(
             "docker-compose.yml",
-            "services:\n  api:\n    env_file: missing.env\n",
+            "services:\n  api:\n    env_file: missing.env\n    environment:\n      K: v\n",
         )]);
         let api = service(&project, "api");
         assert_eq!(api.gaps.len(), 1);
@@ -525,6 +637,17 @@ mod tests {
         // The path is still recorded: a service reading a file envwire cannot see has
         // a source the root .env knows nothing about.
         assert_eq!(api.sources.len(), 1);
+    }
+
+    #[test]
+    fn a_gap_below_a_value_cannot_overrule_it() {
+        let (_dir, project) = project(&[(
+            "docker-compose.yml",
+            "services:\n  api:\n    env_file: missing.env\n    environment:\n      SAFE: v\n",
+        )]);
+        let api = service(&project, "api");
+        // Nothing an env file says beats `environment:`, so this one is settled.
+        assert!(api.settled(var(api, "SAFE")));
     }
 
     #[test]
@@ -541,46 +664,49 @@ mod tests {
     }
 
     #[test]
-    fn a_gap_below_a_value_cannot_overrule_it() {
-        let (_dir, project) = project(&[
-            ("b.env", "K=v\n"),
-            (
-                "docker-compose.yml",
-                "services:\n  api:\n    env_file:\n      - missing.env\n      - b.env\n",
-            ),
-        ]);
+    fn a_key_named_by_a_variable_is_a_gap_over_the_whole_service() {
+        let (_dir, project) = project(&[(
+            "docker-compose.yml",
+            "services:\n  api:\n    environment:\n      - ${WHICH}=value\n      - PLAIN=v\n",
+        )]);
         let api = service(&project, "api");
-        // A later file wins, so nothing unread below it can change this value.
-        assert!(api.settled(var(api, "K")));
+        assert!(matches!(api.gaps[0].what, Missing::DynamicKey(_)));
+        assert_eq!(api.gaps[0].layer, Layer::Inline);
+        // It could override anything, so nothing in this service is settled.
+        assert!(!api.settled(var(api, "PLAIN")));
     }
 
     #[test]
-    fn a_bare_name_in_an_env_file_is_a_value_nobody_here_can_see() {
+    fn keys_keep_the_order_they_were_first_set_in() {
         let (_dir, project) = project(&[
-            ("svc.env", "PASS_THROUGH\n"),
+            ("svc.env", "FIRST=1\nSECOND=2\n"),
             (
                 "docker-compose.yml",
-                "services:\n  api:\n    env_file: svc.env\n",
+                "services:\n  api:\n    env_file: svc.env\n    environment:\n      FIRST: overridden\n      THIRD: 3\n",
             ),
         ]);
-        let api = service(&project, "api");
-        assert_eq!(var(api, "PASS_THROUGH").bound.value, Value::Unknown);
+        let keys: Vec<&str> = service(&project, "api")
+            .vars
+            .iter()
+            .map(|v| v.key.as_str())
+            .collect();
+        assert_eq!(keys, ["FIRST", "SECOND", "THIRD"]);
     }
 
     #[test]
-    fn an_env_file_hangs_off_the_compose_files_own_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir(dir.path().join("config")).unwrap();
-        std::fs::write(dir.path().join("config/svc.env"), "K=found\n").unwrap();
-        std::fs::write(
-            dir.path().join("docker-compose.yml"),
-            "services:\n  api:\n    env_file: config/svc.env\n",
-        )
-        .unwrap();
-        let project = read(&crate::sources::discover(dir.path())).unwrap();
+    fn the_project_env_does_not_leak_into_a_container() {
+        // The single largest false-positive generator, closed by construction:
+        // verified against `docker compose config` that a .env key nothing names
+        // reaches no container at all.
+        let (_dir, project) = project(&[
+            (".env", "NEVER_ASKED_FOR=x\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    environment:\n      K: v\n",
+            ),
+        ]);
         let api = service(&project, "api");
-        assert_eq!(var(api, "K").bound.value, Value::Literal("found".into()));
-        assert!(api.gaps.is_empty());
+        assert!(api.vars.iter().all(|v| v.key != "NEVER_ASKED_FOR"));
     }
 
     #[test]

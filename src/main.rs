@@ -115,6 +115,9 @@ fn report_services(project: &Project) {
         for var in &service.vars {
             // Never the value itself -- see `Value::disclosure`.
             let mut line = format!("    {:<30} {}", var.key, var.bound.value.disclosure());
+            if let Some(via) = &var.bound.via {
+                line.push_str(&format!(", from {via}"));
+            }
             if !service.settled(var) {
                 line.push_str("  -- something unread could still overrule this");
             }
@@ -122,7 +125,12 @@ fn report_services(project: &Project) {
         }
         for gap in &service.gaps {
             match &gap.what {
-                Missing::UnreadFile(path) => println!("    ! cannot read {}", path.display()),
+                Missing::UnreadFile(path) => {
+                    println!("    ! cannot read {}", path.display());
+                }
+                Missing::DynamicKey(key) => {
+                    println!("    ! a key named by a variable, so its effect is unknown: {key}");
+                }
             }
         }
     }
