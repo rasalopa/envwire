@@ -12,7 +12,7 @@ use clap::Parser;
 
 use crate::cli::Cli;
 use crate::error::{Error, Result};
-use crate::model::Project;
+use crate::model::{Missing, Project};
 use crate::sources::{Source, SourceKind};
 
 /// Nothing to report.
@@ -62,6 +62,7 @@ fn run(cli: &Cli) -> Result<u8> {
         );
     }
     report_references(&project);
+    report_services(&project);
     println!("\nReading these is all envwire does so far. No checks run yet.");
 
     Ok(CLEAN)
@@ -96,6 +97,34 @@ fn report_references(project: &Project) {
             None => "not in .env".to_string(),
         };
         println!("  {:<30} {answer}", reference.name);
+    }
+}
+
+/// What each service's containers would start with.
+///
+/// Every `env_file` in the order written, then `environment` over the top, which is
+/// the order Docker folds them in. Only the winner of each key is here: reporting a
+/// value that something downstream overrides is a false positive by construction.
+fn report_services(project: &Project) {
+    if project.services.is_empty() {
+        return;
+    }
+    println!("\nwhat each service would start with:");
+    for service in &project.services {
+        println!("  {}", service.name);
+        for var in &service.vars {
+            // Never the value itself -- see `Value::disclosure`.
+            let mut line = format!("    {:<30} {}", var.key, var.bound.value.disclosure());
+            if !service.settled(var) {
+                line.push_str("  -- something unread could still overrule this");
+            }
+            println!("{line}");
+        }
+        for gap in &service.gaps {
+            match &gap.what {
+                Missing::UnreadFile(path) => println!("    ! cannot read {}", path.display()),
+            }
+        }
     }
 }
 

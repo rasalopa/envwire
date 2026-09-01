@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::compose;
 use crate::dotenv::{self, Malformed};
 use crate::error::{Error, Result};
 use crate::sources::{Source, SourceKind};
@@ -30,6 +31,7 @@ impl fmt::Display for Origin {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bound {
     pub value: Value,
+    /// The place that decided this key.
     pub origin: Origin,
 }
 
@@ -87,6 +89,65 @@ pub struct Reference {
     pub origin: Origin,
 }
 
+/// Which layer of a service's environment set a key.
+///
+/// Ordered on purpose, and the derived `Ord` is the precedence rule itself: a later
+/// `env_file` beats an earlier one. Confirmed against `docker compose config`, per
+/// key rather than per file. The layer `environment:` sets arrives with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Layer {
+    EnvFile(usize),
+}
+
+/// Something about a service envwire could not read, and how far up it reaches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Gap {
+    pub layer: Layer,
+    pub what: Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Missing {
+    /// An `env_file:` that is not on disk. Its contents are a guess, and a guess must
+    /// silence a finding rather than be treated as an empty file.
+    UnreadFile(PathBuf),
+}
+
+/// One variable a service's containers would start with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Var {
+    pub key: String,
+    pub bound: Bound,
+    pub layer: Layer,
+}
+
+/// The environment one service's containers would start with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceEnv {
+    pub name: String,
+    /// Keys in the order they were first set, values as last written. Losers are
+    /// dropped: reporting a value that something downstream overrides is a false
+    /// positive by construction.
+    pub vars: Vec<Var>,
+    /// The `env_file:` list, resolved and in order, whether or not each one read.
+    /// A check needs this even when none of their values survived the fold: a service
+    /// reading `./config/.env.production` has a source the root `.env` knows nothing
+    /// about, and calling that disagreement drift would be wrong.
+    pub sources: Vec<PathBuf>,
+    pub gaps: Vec<Gap>,
+}
+
+impl ServiceEnv {
+    /// Whether anything envwire could not read could still overrule `var`.
+    ///
+    /// Exact rather than conservative: a value from a later env file survives a gap
+    /// in an earlier one, because a later file wins. Only what could still overrule
+    /// this key silences it.
+    pub fn settled(&self, var: &Var) -> bool {
+        self.gaps.iter().all(|gap| gap.layer < var.layer)
+    }
+}
+
 /// Everything the checks are allowed to reason from.
 #[derive(Debug)]
 pub struct Project {
@@ -97,6 +158,8 @@ pub struct Project {
     pub compose: Option<PathBuf>,
     /// Every reference in the raw Compose text, with its line. Duplicates kept.
     pub references: Vec<Reference>,
+    /// What each service would actually be handed. Empty without a Compose file.
+    pub services: Vec<ServiceEnv>,
 }
 
 /// Read a project into the one shape every check reasons from.
@@ -126,15 +189,22 @@ pub fn read(sources: &[Source]) -> Result<Project> {
         .iter()
         .find(|s| s.kind == SourceKind::Compose)
         .map(|s| s.path.clone());
-    let references = match &compose {
+    let (references, services) = match &compose {
         Some(path) => {
             let raw = fs::read_to_string(path).map_err(|source| Error::Read {
                 path: path.clone(),
                 source,
             })?;
-            scan(&raw, path)
+            let parsed = compose::read(path)?;
+            let mut cache = HashMap::new();
+            let services = parsed
+                .services
+                .iter()
+                .map(|service| fold(service, path, &mut cache))
+                .collect();
+            (scan(&raw, path), services)
         }
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
 
     Ok(Project {
@@ -142,7 +212,85 @@ pub fn read(sources: &[Source]) -> Result<Project> {
         interpolation,
         compose,
         references,
+        services,
     })
+}
+
+/// Work out what one service's containers would start with.
+///
+/// The order is Docker's: every `env_file` in the order written, then `environment`
+/// over the top, last writer winning per key. Nothing here consults the shell.
+fn fold(
+    service: &compose::Service,
+    compose_path: &Path,
+    cache: &mut HashMap<PathBuf, Vec<Setting>>,
+) -> ServiceEnv {
+    let mut env = ServiceEnv {
+        name: service.name.clone(),
+        vars: Vec::new(),
+        sources: Vec::new(),
+        gaps: Vec::new(),
+    };
+
+    // `env_file:` hangs off the Compose file's own folder -- a different anchor from
+    // the project directory that locates `.env`, and getting it wrong is a
+    // file-not-found on every layout where the two differ.
+    let anchor = compose_path.parent().unwrap_or(Path::new("."));
+    for (index, relative) in service.env_files.iter().enumerate() {
+        let path = anchor.join(relative);
+        env.sources.push(path.clone());
+
+        let layer = Layer::EnvFile(index);
+        let settings = match cache.get(&path) {
+            Some(settings) => settings.clone(),
+            None => match dotenv::read(&path) {
+                // An env file Compose reads is an env file, so it gets the same
+                // forgiveness a `.env` does.
+                Ok(doc) => {
+                    let (settings, _) = settings_of(doc, SourceKind::Env);
+                    cache.insert(path.clone(), settings.clone());
+                    settings
+                }
+                Err(_) => {
+                    env.gaps.push(Gap {
+                        layer,
+                        what: Missing::UnreadFile(path),
+                    });
+                    continue;
+                }
+            },
+        };
+
+        for setting in settings {
+            // A bare name inside an env file asks for a value envwire cannot see.
+            let value = setting.value.unwrap_or(Value::Unknown);
+            set(
+                &mut env.vars,
+                setting.key,
+                Bound {
+                    value,
+                    origin: Origin::Line {
+                        path: path.clone(),
+                        line: setting.line,
+                    },
+                },
+                layer,
+            );
+        }
+    }
+
+    env
+}
+
+/// Last writer wins, and the order a key was first set in is kept.
+fn set(vars: &mut Vec<Var>, key: String, bound: Bound, layer: Layer) {
+    match vars.iter_mut().find(|var| var.key == key) {
+        Some(existing) => {
+            existing.bound = bound;
+            existing.layer = layer;
+        }
+        None => vars.push(Var { key, bound, layer }),
+    }
 }
 
 /// What one file states, with the lines Docker would still accept recovered.
@@ -297,6 +445,142 @@ mod tests {
 
     fn literal(text: &str) -> Option<Value> {
         Some(Value::Literal(text.to_string()))
+    }
+
+    fn service<'a>(project: &'a Project, name: &str) -> &'a ServiceEnv {
+        project
+            .services
+            .iter()
+            .find(|s| s.name == name)
+            .expect("service was folded")
+    }
+
+    fn var<'a>(env: &'a ServiceEnv, key: &str) -> &'a Var {
+        env.vars.iter().find(|v| v.key == key).expect("key was set")
+    }
+
+    #[test]
+    fn an_env_file_becomes_the_service_environment() {
+        let (_dir, project) = project(&[
+            ("svc.env", "HOST=db\nPORT=5432\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file: svc.env\n",
+            ),
+        ]);
+        let api = service(&project, "api");
+        let keys: Vec<&str> = api.vars.iter().map(|v| v.key.as_str()).collect();
+        assert_eq!(keys, ["HOST", "PORT"]);
+        assert_eq!(var(api, "HOST").bound.value, Value::Literal("db".into()));
+    }
+
+    #[test]
+    fn a_later_env_file_beats_an_earlier_one() {
+        // Verified against `docker compose config`: per key, in the order written.
+        let (_dir, project) = project(&[
+            ("a.env", "K=first\nONLY_A=kept\n"),
+            ("b.env", "K=second\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file:\n      - a.env\n      - b.env\n",
+            ),
+        ]);
+        let api = service(&project, "api");
+        assert_eq!(var(api, "K").bound.value, Value::Literal("second".into()));
+        assert_eq!(var(api, "K").layer, Layer::EnvFile(1));
+        assert_eq!(
+            var(api, "ONLY_A").bound.value,
+            Value::Literal("kept".into())
+        );
+    }
+
+    #[test]
+    fn keys_keep_the_order_they_were_first_set_in() {
+        let (_dir, project) = project(&[
+            ("a.env", "FIRST=1\nSECOND=2\n"),
+            ("b.env", "FIRST=overridden\nTHIRD=3\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file:\n      - a.env\n      - b.env\n",
+            ),
+        ]);
+        let keys: Vec<&str> = service(&project, "api")
+            .vars
+            .iter()
+            .map(|v| v.key.as_str())
+            .collect();
+        assert_eq!(keys, ["FIRST", "SECOND", "THIRD"]);
+    }
+
+    #[test]
+    fn an_env_file_that_is_not_there_is_a_gap_not_an_empty_file() {
+        let (_dir, project) = project(&[(
+            "docker-compose.yml",
+            "services:\n  api:\n    env_file: missing.env\n",
+        )]);
+        let api = service(&project, "api");
+        assert_eq!(api.gaps.len(), 1);
+        assert!(matches!(api.gaps[0].what, Missing::UnreadFile(_)));
+        assert_eq!(api.gaps[0].layer, Layer::EnvFile(0));
+        // The path is still recorded: a service reading a file envwire cannot see has
+        // a source the root .env knows nothing about.
+        assert_eq!(api.sources.len(), 1);
+    }
+
+    #[test]
+    fn a_gap_above_a_value_silences_it() {
+        let (_dir, project) = project(&[
+            ("a.env", "K=v\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file:\n      - a.env\n      - missing.env\n",
+            ),
+        ]);
+        let api = service(&project, "api");
+        assert!(!api.settled(var(api, "K")));
+    }
+
+    #[test]
+    fn a_gap_below_a_value_cannot_overrule_it() {
+        let (_dir, project) = project(&[
+            ("b.env", "K=v\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file:\n      - missing.env\n      - b.env\n",
+            ),
+        ]);
+        let api = service(&project, "api");
+        // A later file wins, so nothing unread below it can change this value.
+        assert!(api.settled(var(api, "K")));
+    }
+
+    #[test]
+    fn a_bare_name_in_an_env_file_is_a_value_nobody_here_can_see() {
+        let (_dir, project) = project(&[
+            ("svc.env", "PASS_THROUGH\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file: svc.env\n",
+            ),
+        ]);
+        let api = service(&project, "api");
+        assert_eq!(var(api, "PASS_THROUGH").bound.value, Value::Unknown);
+    }
+
+    #[test]
+    fn an_env_file_hangs_off_the_compose_files_own_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        std::fs::write(dir.path().join("config/svc.env"), "K=found\n").unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  api:\n    env_file: config/svc.env\n",
+        )
+        .unwrap();
+        let project = read(&crate::sources::discover(dir.path())).unwrap();
+        let api = service(&project, "api");
+        assert_eq!(var(api, "K").bound.value, Value::Literal("found".into()));
+        assert!(api.gaps.is_empty());
     }
 
     #[test]
