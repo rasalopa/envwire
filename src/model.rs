@@ -3,7 +3,7 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::compose;
+use crate::compose::{self, KeySource};
 use crate::dotenv::{self, Malformed};
 use crate::error::{Error, Result};
 use crate::sources::{Source, SourceKind};
@@ -172,7 +172,12 @@ pub struct Project {
     /// The Compose file, when there is one. A question about what containers receive
     /// has no answer in a project without it.
     pub compose: Option<PathBuf>,
-    /// Every reference in the raw Compose text, with its line. Duplicates kept.
+    /// Every reference in the Compose text and in the env files its services read,
+    /// with the line that names it. Duplicates kept.
+    ///
+    /// Docker interpolates env-file values too, so a `${BASE}` written in one is a
+    /// real use of the project `.env`. Scanning only the Compose file would let a
+    /// usage check call BASE unused while a container plainly reads it.
     pub references: Vec<Reference>,
     /// What each service would actually be handed. Empty without a Compose file.
     pub services: Vec<ServiceEnv>,
@@ -213,12 +218,13 @@ pub fn read(sources: &[Source]) -> Result<Project> {
             })?;
             let parsed = compose::read(path)?;
             let mut cache = HashMap::new();
+            let mut references = scan(&raw, path);
             let services = parsed
                 .services
                 .iter()
-                .map(|service| fold(service, path, &interpolation, &mut cache))
+                .map(|service| fold(service, path, &interpolation, &mut cache, &mut references))
                 .collect();
-            (scan(&raw, path), services)
+            (references, services)
         }
         None => (Vec::new(), Vec::new()),
     };
@@ -240,7 +246,8 @@ fn fold(
     service: &compose::Service,
     compose_path: &Path,
     interpolation: &Interpolation,
-    cache: &mut HashMap<PathBuf, Vec<Setting>>,
+    cache: &mut HashMap<PathBuf, ReadFile>,
+    references: &mut Vec<Reference>,
 ) -> ServiceEnv {
     let mut env = ServiceEnv {
         name: service.name.clone(),
@@ -253,54 +260,78 @@ fn fold(
     // the project directory that locates `.env`, and getting it wrong is a
     // file-not-found on every layout where the two differ.
     let anchor = compose_path.parent().unwrap_or(Path::new("."));
-    for (index, relative) in service.env_files.iter().enumerate() {
-        let path = anchor.join(relative);
+    for (index, wanted) in service.env_files.iter().enumerate() {
+        let path = anchor.join(&wanted.path);
         env.sources.push(path.clone());
 
         let layer = Layer::EnvFile(index);
-        let settings = match cache.get(&path) {
-            Some(settings) => settings.clone(),
-            None => match dotenv::read(&path) {
-                // An env file Compose reads is an env file, so it gets the same
-                // forgiveness a `.env` does.
-                Ok(doc) => {
-                    let (settings, _) = settings_of(doc, SourceKind::Env);
-                    cache.insert(path.clone(), settings.clone());
-                    settings
+        let read = match cache.get(&path) {
+            Some(read) => read.clone(),
+            None => match read_env_file(&path) {
+                Some(read) => {
+                    cache.insert(path.clone(), read.clone());
+                    read
                 }
-                Err(_) => {
-                    env.gaps.push(Gap {
-                        layer,
-                        what: Missing::UnreadFile(path),
-                    });
+                None => {
+                    // An optional file the author said might be missing is a resolved
+                    // fact, not something envwire failed to read. Verified: Compose
+                    // renders such a project without a word.
+                    if wanted.required {
+                        env.gaps.push(Gap {
+                            layer,
+                            what: Missing::UnreadFile(path),
+                        });
+                    }
                     continue;
                 }
             },
         };
+        references.extend(read.references.iter().cloned());
 
-        for setting in settings {
-            // A bare name inside an env file asks for a value envwire cannot see.
-            let value = setting.value.unwrap_or(Value::Unknown);
-            set(
-                &mut env.vars,
-                setting.key,
-                Bound {
-                    value,
-                    origin: Origin::Line {
-                        path: path.clone(),
-                        line: setting.line,
+        for setting in read.settings {
+            match setting.value {
+                Some(value) => set(
+                    &mut env.vars,
+                    setting.key,
+                    Bound {
+                        value,
+                        origin: Origin::Line {
+                            path: path.clone(),
+                            line: setting.line,
+                        },
+                        via: None,
                     },
-                    via: None,
-                },
-                layer,
-            );
+                    layer,
+                ),
+                // A bare name in an env file is a request, not an assignment. Docker
+                // answers it from the project `.env` (verified), and drops the key
+                // entirely when nothing answers -- which leaves whatever an earlier
+                // layer set standing. Overwriting it here erased a real value.
+                None => {
+                    if let Some(found) = interpolation.get(&setting.key) {
+                        set(
+                            &mut env.vars,
+                            setting.key,
+                            Bound {
+                                value: found.value.clone(),
+                                origin: Origin::Line {
+                                    path: path.clone(),
+                                    line: setting.line,
+                                },
+                                via: Some(found.origin.clone()),
+                            },
+                            layer,
+                        );
+                    }
+                }
+            }
         }
     }
 
     for assignment in &service.environment {
-        // Interpolation never applies to a mapping key, so a key envwire cannot name
-        // is one it must not report on.
-        if !dotenv::is_name(&assignment.key) {
+        // Only the list form interpolates keys. A mapping key holding `${...}` is
+        // literal text, and calling it dynamic would silence the whole service.
+        if assignment.key_source == KeySource::List && assignment.key.contains('$') {
             env.gaps.push(Gap {
                 layer: Layer::Inline,
                 what: Missing::DynamicKey(assignment.key.clone()),
@@ -340,6 +371,27 @@ fn fold(
     }
 
     env
+}
+
+/// One env file, read once and kept for whichever other services name it.
+#[derive(Clone)]
+struct ReadFile {
+    settings: Vec<Setting>,
+    references: Vec<Reference>,
+}
+
+/// Read an env file a Compose service names, or `None` when it is not there.
+///
+/// An env file Compose reads is an env file, so it gets the same forgiveness a `.env`
+/// does. Its values are scanned as well as parsed: Docker interpolates them against
+/// the project `.env`, so a `${BASE}` in one is a real use of BASE.
+fn read_env_file(path: &Path) -> Option<ReadFile> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let (settings, _) = settings_of(dotenv::parse(&text), SourceKind::Env);
+    Some(ReadFile {
+        references: scan(&text, path),
+        settings,
+    })
 }
 
 /// Last writer wins, and the order a key was first set in is kept.
@@ -522,6 +574,116 @@ mod tests {
 
     fn value(env: &ServiceEnv, key: &str) -> Value {
         var(env, key).bound.value.clone()
+    }
+
+    #[test]
+    fn a_mapping_key_holding_a_variable_is_literal_text_not_a_gap() {
+        // Verified against `docker compose config`: it renders the key back as
+        // `$${WHICH}`, which is Compose saying the text is literal. Filing it as a
+        // dynamic key would silence every finding for this service.
+        let (_dir, project) = project(&[
+            (".env", "WHICH=CHOSEN\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    environment:\n      ${WHICH}: a-value\n      PLAIN: v\n",
+            ),
+        ]);
+        let api = service(&project, "api");
+        assert!(api.gaps.is_empty(), "{:?}", api.gaps);
+        assert!(api.settled(var(api, "PLAIN")));
+    }
+
+    #[test]
+    fn a_list_key_holding_a_variable_really_is_a_gap() {
+        // The list form does interpolate keys, so here envwire genuinely cannot say
+        // what the service is handed.
+        let (_dir, project) = project(&[(
+            "docker-compose.yml",
+            "services:\n  api:\n    environment:\n      - ${WHICH}=a-value\n",
+        )]);
+        let api = service(&project, "api");
+        assert_eq!(api.gaps.len(), 1);
+        assert!(matches!(api.gaps[0].what, Missing::DynamicKey(_)));
+    }
+
+    #[test]
+    fn an_env_file_declared_optional_is_not_a_gap_when_absent() {
+        // Verified: `docker compose config` renders this cleanly and exits 0. The
+        // author said the file may be missing, so its absence is a resolved fact.
+        let (_dir, project) = project(&[
+            ("base.env", "TOKEN=from-base\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file:\n      - base.env\n      - path: nope.env\n        required: false\n",
+            ),
+        ]);
+        let api = service(&project, "api");
+        assert!(api.gaps.is_empty(), "{:?}", api.gaps);
+        assert!(api.settled(var(api, "TOKEN")));
+    }
+
+    #[test]
+    fn a_bare_name_nothing_answers_leaves_the_earlier_value_standing() {
+        // Verified: with TOKEN unset everywhere, Docker keeps `from-first`. A bare
+        // name is a request, and an unanswered request removes nothing.
+        let (_dir, project) = project(&[
+            ("one.env", "TOKEN=from-first\n"),
+            ("two.env", "TOKEN\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file:\n      - one.env\n      - two.env\n",
+            ),
+        ]);
+        let api = service(&project, "api");
+        assert_eq!(
+            var(api, "TOKEN").bound.value,
+            Value::Literal("from-first".into())
+        );
+        assert_eq!(var(api, "TOKEN").layer, Layer::EnvFile(0));
+    }
+
+    #[test]
+    fn a_bare_name_the_project_env_answers_does_win() {
+        // Verified: with `.env` holding TOKEN, Docker prefers it over the earlier
+        // file, because the request was answered at the later layer.
+        let (_dir, project) = project(&[
+            (".env", "TOKEN=from-project-dotenv\n"),
+            ("one.env", "TOKEN=from-first\n"),
+            ("two.env", "TOKEN\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file:\n      - one.env\n      - two.env\n",
+            ),
+        ]);
+        let api = service(&project, "api");
+        assert_eq!(
+            var(api, "TOKEN").bound.value,
+            Value::Literal("from-project-dotenv".into())
+        );
+        // And the reader is sent to the line that actually holds the text.
+        assert!(matches!(
+            var(api, "TOKEN").bound.via,
+            Some(Origin::Line { line: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_variable_named_inside_an_env_file_counts_as_used() {
+        // Docker interpolates env-file values against the project `.env`, so BASE is
+        // genuinely read here. Missing it makes a usage check call BASE unused.
+        let (_dir, project) = project(&[
+            (".env", "BASE=resolved\n"),
+            ("svc.env", "FROM_FILE=${BASE}/tail\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file: svc.env\n",
+            ),
+        ]);
+        assert!(
+            project.references.iter().any(|r| r.name == "BASE"),
+            "{:?}",
+            project.references
+        );
     }
 
     #[test]

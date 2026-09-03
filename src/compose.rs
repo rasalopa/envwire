@@ -5,13 +5,41 @@ use yaml_rust2::{Yaml, YamlLoader};
 
 use crate::error::{Error, Result};
 
+/// How a key was written, which decides whether Compose expanded it.
+///
+/// Only the list form interpolates keys. In the mapping form `${WHICH}: value` is a
+/// key literally named `${WHICH}` -- `docker compose config` renders it back as
+/// `$${WHICH}`, which is Compose saying the text stands as typed. Reading the two
+/// forms alike makes envwire declare it cannot know what the service is handed, and
+/// that admission silences every finding for the service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// `KEY: value`. Never interpolated.
+    Mapping,
+    /// `- KEY=value`. Compose expands the key as well as the value.
+    List,
+}
+
 /// One variable a service is given.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Assignment {
     pub key: String,
+    pub key_source: KeySource,
     /// `None` when the service takes whatever the host has, which Compose writes
     /// as a bare `- REDIS_HOST` or a `REDIS_HOST:` with nothing after it.
     pub value: Option<String>,
+}
+
+/// A file a service pulls variables from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvFileRef {
+    /// As written in the file, so still relative to the Compose file's directory.
+    pub path: PathBuf,
+    /// Compose refuses to start when a required file is missing, so its absence is a
+    /// broken project. An optional one that is absent is a resolved fact the author
+    /// wrote down, and treating that as something envwire could not read invents a
+    /// doubt the project does not have.
+    pub required: bool,
 }
 
 /// A service and the environment the Compose file gives it.
@@ -20,8 +48,7 @@ pub struct Service {
     pub name: String,
     /// Set inline, in file order. Repeats are kept; which one wins is a finding.
     pub environment: Vec<Assignment>,
-    /// As written in the file, so still relative to the Compose file's directory.
-    pub env_files: Vec<PathBuf>,
+    pub env_files: Vec<EnvFileRef>,
 }
 
 /// What a Compose file hands to each of its services.
@@ -134,6 +161,7 @@ fn environment_of(node: &Yaml) -> Vec<Assignment> {
                 let key = key.as_str()?;
                 Some(Assignment {
                     key: key.to_string(),
+                    key_source: KeySource::Mapping,
                     value: scalar(value),
                 })
             })
@@ -149,10 +177,12 @@ fn environment_of(node: &Yaml) -> Vec<Assignment> {
                 Some(match item.split_once('=') {
                     Some((key, value)) => Assignment {
                         key: key.trim().to_string(),
+                        key_source: KeySource::List,
                         value: Some(value.to_string()),
                     },
                     None => Assignment {
                         key: item.trim().to_string(),
+                        key_source: KeySource::List,
                         value: None,
                     },
                 })
@@ -164,15 +194,23 @@ fn environment_of(node: &Yaml) -> Vec<Assignment> {
 }
 
 /// Read an `env_file:`, which may name one file, several, or several with options.
-fn env_files_of(node: &Yaml) -> Vec<PathBuf> {
+fn env_files_of(node: &Yaml) -> Vec<EnvFileRef> {
+    let required = |path: &str| EnvFileRef {
+        path: PathBuf::from(path),
+        required: true,
+    };
     match node {
-        Yaml::String(one) => vec![PathBuf::from(one)],
+        Yaml::String(one) => vec![required(one)],
         Yaml::Array(items) => items
             .iter()
             .filter_map(|item| match item {
-                Yaml::String(path) => Some(PathBuf::from(path)),
-                // The long form: `- path: .env.local` with `required:` beside it.
-                Yaml::Hash(_) => item["path"].as_str().map(PathBuf::from),
+                Yaml::String(path) => Some(required(path)),
+                // The long form: `- path: .env.local` with `required:` beside it,
+                // which defaults to true when the author leaves it out.
+                Yaml::Hash(_) => item["path"].as_str().map(|path| EnvFileRef {
+                    path: PathBuf::from(path),
+                    required: item["required"].as_bool().unwrap_or(true),
+                }),
                 _ => None,
             })
             .collect(),
@@ -213,6 +251,10 @@ mod tests {
         let mut compose = parse_ok(text);
         assert_eq!(compose.services.len(), 1);
         compose.services.remove(0)
+    }
+
+    fn paths(service: &Service) -> Vec<&Path> {
+        service.env_files.iter().map(|f| f.path.as_path()).collect()
     }
 
     fn pairs(service: &Service) -> Vec<(&str, Option<&str>)> {
@@ -313,7 +355,8 @@ mod tests {
     #[test]
     fn one_env_file_is_a_list_of_one() {
         let service = only_service("services:\n  api:\n    env_file: .env\n");
-        assert_eq!(service.env_files, [PathBuf::from(".env")]);
+        assert_eq!(paths(&service), [Path::new(".env")]);
+        assert!(service.env_files[0].required);
     }
 
     #[test]
@@ -321,8 +364,8 @@ mod tests {
         let service =
             only_service("services:\n  api:\n    env_file:\n      - .env\n      - .env.local\n");
         assert_eq!(
-            service.env_files,
-            [PathBuf::from(".env"), PathBuf::from(".env.local")]
+            paths(&service),
+            [Path::new(".env"), Path::new(".env.local")]
         );
     }
 
@@ -331,7 +374,9 @@ mod tests {
         let service = only_service(
             "services:\n  api:\n    env_file:\n      - path: .env.local\n        required: false\n",
         );
-        assert_eq!(service.env_files, [PathBuf::from(".env.local")]);
+        assert_eq!(paths(&service), [Path::new(".env.local")]);
+        // The author said it may be missing, so its absence is a fact, not a doubt.
+        assert!(!service.env_files[0].required);
     }
 
     #[test]
@@ -405,7 +450,8 @@ mod tests {
             "x-base: &base\n  environment:\n    TZ: UTC\n  env_file: .env\nservices:\n  api:\n    <<: *base\n    image: node\n",
         );
         assert_eq!(pairs(&service), [("TZ", Some("UTC"))]);
-        assert_eq!(service.env_files, [PathBuf::from(".env")]);
+        assert_eq!(paths(&service), [Path::new(".env")]);
+        assert!(service.env_files[0].required);
     }
 
     #[test]
