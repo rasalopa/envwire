@@ -50,7 +50,8 @@ fn run(cli: &Cli) -> Result<u8> {
     }
 
     let project = model::read(&found)?;
-    let findings = check::documented(&project);
+    let mut findings = check::documented(&project);
+    findings.extend(check::reachable(&project));
 
     // `check` says only what is wrong: a note is not wrong, and a CI log full of
     // remarks nobody has to act on is how a build check gets muted.
