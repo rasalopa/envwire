@@ -7,7 +7,7 @@ use crate::compose::{self, KeySource};
 use crate::dotenv::{self, Malformed};
 use crate::error::{Error, Result};
 use crate::sources::{Source, SourceKind};
-use crate::template::{Template, Value};
+use crate::template::{Template, Use, Value};
 
 /// Where something is written.
 ///
@@ -58,6 +58,9 @@ pub struct Setting {
 /// One `.env`-shaped file, kept whole.
 #[derive(Debug, Clone)]
 pub struct EnvFile {
+    /// What the file claims to be -- values a developer runs with, or the ones a
+    /// newcomer is promised. A different question from whether Compose reads it.
+    pub kind: SourceKind,
     pub path: PathBuf,
     /// File order, duplicates kept: which of two assignments wins is a finding, and
     /// collapsing them would throw away the evidence that there were two.
@@ -97,6 +100,10 @@ impl Interpolation {
 pub struct Reference {
     pub name: String,
     pub origin: Origin,
+    /// Whether this use carries its own fallback. A variable every use defaults is
+    /// one whose absence breaks nothing, and saying otherwise is noise: in one real
+    /// project, 18 of the 24 keys missing from `.env` were defaulted in Compose.
+    pub defaulted: bool,
 }
 
 /// Which layer of a service's environment set a key.
@@ -198,6 +205,7 @@ pub fn read(sources: &[Source]) -> Result<Project> {
         let doc = dotenv::read(&source.path)?;
         let (settings, malformed) = settings_of(doc, source.kind);
         files.push(EnvFile {
+            kind: source.kind,
             path: source.path.clone(),
             settings,
             malformed,
@@ -514,15 +522,16 @@ fn interpolation_of(files: &[EnvFile]) -> Interpolation {
 fn scan(raw: &str, path: &Path) -> Vec<Reference> {
     let mut references = Vec::new();
     for (index, line) in raw.lines().enumerate() {
-        let mut names = Vec::new();
-        Template::parse(line).names(&mut names);
-        for name in names {
+        let mut uses: Vec<Use> = Vec::new();
+        Template::parse(line).uses(&mut uses);
+        for used in uses {
             references.push(Reference {
-                name,
+                name: used.name,
                 origin: Origin::Line {
                     path: path.to_path_buf(),
                     line: index + 1,
                 },
+                defaulted: used.defaulted,
             });
         }
     }

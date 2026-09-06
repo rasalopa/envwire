@@ -1,3 +1,4 @@
+mod check;
 mod cli;
 mod compose;
 mod dotenv;
@@ -6,10 +7,12 @@ mod model;
 mod sources;
 mod template;
 
+use std::path::Path;
 use std::process::ExitCode;
 
 use clap::Parser;
 
+use crate::check::{Finding, Weight};
 use crate::cli::Cli;
 use crate::error::{Error, Result};
 use crate::model::{Missing, Project};
@@ -17,6 +20,8 @@ use crate::sources::{Source, SourceKind};
 
 /// Nothing to report.
 const CLEAN: u8 = 0;
+/// The project has findings. This is what `check` exists to return.
+const FINDINGS: u8 = 1;
 /// envwire could not look, so nobody should read agreement into the silence.
 const FAILED: u8 = 2;
 
@@ -37,18 +42,27 @@ fn run(cli: &Cli) -> Result<u8> {
     }
 
     let found = sources::discover(&target);
-
-    // check speaks only in findings, and no check is wired up yet.
-    if cli.is_quiet() {
-        return Ok(CLEAN);
-    }
-
     if found.is_empty() {
-        println!("{}: no env sources here.", target.display());
+        if !cli.is_quiet() {
+            println!("{}: no env sources here.", target.display());
+        }
         return Ok(CLEAN);
     }
 
     let project = model::read(&found)?;
+    let findings = check::documented(&project);
+
+    // `check` says only what is wrong: a note is not wrong, and a CI log full of
+    // remarks nobody has to act on is how a build check gets muted.
+    if cli.is_quiet() {
+        let problems: Vec<Finding> = findings
+            .iter()
+            .filter(|f| f.weight == Weight::Problem)
+            .cloned()
+            .collect();
+        report_findings(&problems, &target, false);
+        return Ok(exit_code(&findings));
+    }
 
     // The heading carries the directory, so each line only needs the name under it.
     println!("{}", target.display());
@@ -63,9 +77,60 @@ fn run(cli: &Cli) -> Result<u8> {
     }
     report_references(&project);
     report_services(&project);
-    println!("\nReading these is all envwire does so far. No checks run yet.");
+    report_findings(&findings, &target, true);
 
-    Ok(CLEAN)
+    Ok(exit_code(&findings))
+}
+
+/// A problem is worth failing a build over; a note is not.
+fn exit_code(findings: &[Finding]) -> u8 {
+    if findings.iter().any(|f| f.weight == Weight::Problem) {
+        FINDINGS
+    } else {
+        CLEAN
+    }
+}
+
+fn report_findings(findings: &[Finding], target: &Path, summarise: bool) {
+    if findings.is_empty() {
+        if summarise {
+            println!("\nNothing to report.");
+        }
+        return;
+    }
+
+    println!();
+    for finding in findings {
+        let mark = match finding.weight {
+            Weight::Problem => "x",
+            Weight::Note => "-",
+        };
+        // Paths read better relative to what the reader asked about.
+        let at = match &finding.at {
+            crate::model::Origin::Line { path, line } => {
+                let short = path.strip_prefix(target).unwrap_or(path);
+                format!("{}:{line}", short.display())
+            }
+            other => other.to_string(),
+        };
+        println!("{mark} {}", finding.what);
+        println!("  {at}");
+        if let Some(because) = &finding.because {
+            println!("  {because}");
+        }
+    }
+
+    if summarise {
+        let problems = findings
+            .iter()
+            .filter(|f| f.weight == Weight::Problem)
+            .count();
+        println!(
+            "\n{}, {}",
+            count(problems, "problem"),
+            count(findings.len() - problems, "note")
+        );
+    }
 }
 
 /// What the Compose file asks the project `.env` for.

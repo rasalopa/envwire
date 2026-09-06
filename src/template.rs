@@ -49,6 +49,18 @@ impl Value {
     }
 }
 
+/// One place a value names a variable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Use {
+    pub name: String,
+    /// Whether this use carries its own fallback, so the project still starts when
+    /// nothing defines the variable.
+    ///
+    /// Only a default counts. An alternate (`${VAR:+x}`) says what to do when the
+    /// variable IS there, and the `?` forms abort rather than stand in for it.
+    pub defaulted: bool,
+}
+
 /// A value out of a Compose file, split into text and the variables it names.
 ///
 /// Kept as a parse rather than a string because the string lies twice:
@@ -221,13 +233,16 @@ impl Template {
     ///
     /// Duplicates are kept: the caller wants one entry per occurrence, because each
     /// occurrence sits on a line worth pointing at.
-    pub fn names(&self, out: &mut Vec<String>) {
+    pub fn uses(&self, out: &mut Vec<Use>) {
         for segment in &self.0 {
             if let Segment::Reference { name, fallback } = segment {
-                out.push(name.clone());
+                out.push(Use {
+                    name: name.clone(),
+                    defaulted: matches!(fallback, Fallback::Default { .. }),
+                });
                 match fallback {
                     Fallback::Default { value, .. } | Fallback::Alternate { value, .. } => {
-                        value.names(out);
+                        value.uses(out);
                     }
                     Fallback::None => {}
                 }
@@ -335,8 +350,28 @@ mod tests {
 
     fn names_of(text: &str) -> Vec<String> {
         let mut out = Vec::new();
-        Template::parse(text).names(&mut out);
-        out
+        Template::parse(text).uses(&mut out);
+        out.into_iter().map(|u| u.name).collect()
+    }
+
+    fn defaults_of(text: &str) -> Vec<bool> {
+        let mut out = Vec::new();
+        Template::parse(text).uses(&mut out);
+        out.into_iter().map(|u| u.defaulted).collect()
+    }
+
+    #[test]
+    fn a_use_says_whether_it_can_stand_without_the_variable() {
+        // Only a default stands in for a missing variable. An alternate says what to
+        // do when it IS there, and the `?` forms abort instead.
+        assert_eq!(defaults_of("${A:-x}"), [true]);
+        assert_eq!(defaults_of("${A-x}"), [true]);
+        assert_eq!(defaults_of("${A}"), [false]);
+        assert_eq!(defaults_of("$A"), [false]);
+        assert_eq!(defaults_of("${A:+x}"), [false]);
+        assert_eq!(defaults_of("${A:?why}"), [false]);
+        // The nested one is a plain reference, so it is not itself defaulted.
+        assert_eq!(defaults_of("${A:-${B}}"), [true, false]);
     }
 
     #[test]
