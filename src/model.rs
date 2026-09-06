@@ -222,7 +222,7 @@ pub fn read(sources: &[Source]) -> Result<Project> {
             let services = parsed
                 .services
                 .iter()
-                .map(|service| fold(service, path, &interpolation, &mut cache, &mut references))
+                .map(|service| fold(service, &interpolation, &mut cache, &mut references))
                 .collect();
             (references, services)
         }
@@ -244,7 +244,6 @@ pub fn read(sources: &[Source]) -> Result<Project> {
 /// over the top, last writer winning per key. Nothing here consults the shell.
 fn fold(
     service: &compose::Service,
-    compose_path: &Path,
     interpolation: &Interpolation,
     cache: &mut HashMap<PathBuf, ReadFile>,
     references: &mut Vec<Reference>,
@@ -256,12 +255,11 @@ fn fold(
         gaps: Vec::new(),
     };
 
-    // `env_file:` hangs off the Compose file's own folder -- a different anchor from
-    // the project directory that locates `.env`, and getting it wrong is a
-    // file-not-found on every layout where the two differ.
-    let anchor = compose_path.parent().unwrap_or(Path::new("."));
+    // `compose::read` has already resolved these against the file that wrote them,
+    // which is not always this one: a path written in a file a service extends hangs
+    // off that file's folder.
     for (index, wanted) in service.env_files.iter().enumerate() {
-        let path = anchor.join(&wanted.path);
+        let path = wanted.path.clone();
         env.sources.push(path.clone());
 
         let layer = Layer::EnvFile(index);

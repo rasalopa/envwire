@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,10 +31,24 @@ pub struct Assignment {
     pub value: Option<String>,
 }
 
+/// Where a service says it takes its shape from.
+///
+/// Resolved away by [`read`]: after that a service carries the environment it
+/// inherited as if it had been written out in full, which is how Compose treats it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Extends {
+    pub service: String,
+    /// `None` when the base sits in the same file.
+    pub file: Option<PathBuf>,
+}
+
 /// A file a service pulls variables from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvFileRef {
-    /// As written in the file, so still relative to the Compose file's directory.
+    /// As written after [`parse`]; resolved against the file that wrote it after
+    /// [`read`]. The two differ under `extends`: a path written in
+    /// `config/common.yaml` hangs off `config/`, not off the Compose file that
+    /// extends it. Verified against `docker compose config`.
     pub path: PathBuf,
     /// Compose refuses to start when a required file is missing, so its absence is a
     /// broken project. An optional one that is absent is a resolved fact the author
@@ -46,6 +61,8 @@ pub struct EnvFileRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Service {
     pub name: String,
+    /// What this service inherits. Always `None` after [`read`] has folded it in.
+    pub extends: Option<Extends>,
     /// Set inline, in file order. Repeats are kept; which one wins is a finding.
     pub environment: Vec<Assignment>,
     pub env_files: Vec<EnvFileRef>,
@@ -58,16 +75,123 @@ pub struct Compose {
     pub services: Vec<Service>,
 }
 
-/// Read and parse a Compose file.
+/// Read a Compose file and fold `extends:` into the services that use it.
+///
+/// After this, every service carries the environment it would really be given, and
+/// every `env_file:` path is resolved against the file that wrote it -- which is not
+/// always this one.
 pub fn read(path: &Path) -> Result<Compose> {
+    let mut files = HashMap::new();
+    let root = load(path, &mut files)?;
+
+    let mut compose = Compose::default();
+    for service in &root.services {
+        let mut chain = Vec::new();
+        compose
+            .services
+            .push(flatten(service, path, &mut files, &mut chain)?);
+    }
+    Ok(compose)
+}
+
+/// Parse one Compose file, remembering it for whoever else extends into it.
+fn load(path: &Path, files: &mut HashMap<PathBuf, Compose>) -> Result<Compose> {
+    if let Some(known) = files.get(path) {
+        return Ok(known.clone());
+    }
     let text = fs::read_to_string(path).map_err(|source| Error::Read {
         path: path.to_path_buf(),
         source,
     })?;
-    parse(&text).map_err(|message| Error::Yaml {
+    let compose = parse(&text).map_err(|message| Error::Yaml {
         path: path.to_path_buf(),
         message,
-    })
+    })?;
+    files.insert(path.to_path_buf(), compose.clone());
+    Ok(compose)
+}
+
+/// Write out one service in full, following whatever it extends.
+///
+/// The order is what Compose does, verified with `docker compose config`: env files
+/// merge rather than replace, the base's coming first so the extending service's win;
+/// `environment` merges the same way; and the whole `environment` still beats the
+/// whole `env_file` list afterwards, exactly as if the service had been written flat.
+fn flatten(
+    service: &Service,
+    declared_in: &Path,
+    files: &mut HashMap<PathBuf, Compose>,
+    chain: &mut Vec<(PathBuf, String)>,
+) -> Result<Service> {
+    let here = (declared_in.to_path_buf(), service.name.clone());
+    if chain.contains(&here) {
+        // Compose refuses to run this, and following it would not terminate.
+        return Err(Error::Yaml {
+            path: declared_in.to_path_buf(),
+            message: format!("extends forms a cycle at service {}", service.name),
+        });
+    }
+    chain.push(here);
+
+    let mut whole = Service {
+        name: service.name.clone(),
+        extends: None,
+        environment: Vec::new(),
+        env_files: Vec::new(),
+    };
+
+    if let Some(wanted) = &service.extends {
+        let base_path = match &wanted.file {
+            Some(relative) => folder(declared_in).join(relative),
+            None => declared_in.to_path_buf(),
+        };
+        let base_file = load(&base_path, files)?;
+        let base = base_file
+            .services
+            .iter()
+            .find(|candidate| candidate.name == wanted.service)
+            .ok_or_else(|| Error::Yaml {
+                path: declared_in.to_path_buf(),
+                message: format!(
+                    "extends names {}, which {} does not define",
+                    wanted.service,
+                    base_path.display()
+                ),
+            })?
+            .clone();
+
+        let inherited = flatten(&base, &base_path, files, chain)?;
+        whole.env_files.extend(inherited.env_files);
+        whole.environment.extend(inherited.environment);
+    }
+
+    // What the service states itself comes last, so it wins.
+    whole
+        .env_files
+        .extend(service.env_files.iter().map(|file| EnvFileRef {
+            path: folder(declared_in).join(&file.path),
+            required: file.required,
+        }));
+    for stated in &service.environment {
+        // Overriding an inherited value is what `extends` is for, so the two are one
+        // assignment, not a key set twice. Keeping both would leave a later check
+        // reporting a duplicate the author never wrote.
+        match whole
+            .environment
+            .iter_mut()
+            .find(|existing| existing.key == stated.key)
+        {
+            Some(existing) => *existing = stated.clone(),
+            None => whole.environment.push(stated.clone()),
+        }
+    }
+
+    chain.pop();
+    Ok(whole)
+}
+
+fn folder(file: &Path) -> &Path {
+    file.parent().unwrap_or(Path::new("."))
 }
 
 /// Parse Compose YAML.
@@ -86,6 +210,7 @@ pub fn parse(text: &str) -> std::result::Result<Compose, String> {
         let Some(name) = name.as_str() else { continue };
         compose.services.push(Service {
             name: name.to_string(),
+            extends: field(body, "extends").and_then(extends_of),
             environment: field(body, "environment").map_or_else(Vec::new, environment_of),
             env_files: field(body, "env_file").map_or_else(Vec::new, env_files_of),
         });
@@ -148,6 +273,23 @@ fn field<'a>(node: &'a Yaml, name: &str) -> Option<&'a Yaml> {
         .into_iter()
         .find(|(key, _)| key.as_str() == Some(name))
         .map(|(_, value)| value)
+}
+
+/// Read an `extends:`, which names a service and optionally the file holding it.
+fn extends_of(node: &Yaml) -> Option<Extends> {
+    // Older Compose files spell the same-file case as a bare service name.
+    if let Some(name) = node.as_str() {
+        return Some(Extends {
+            service: name.to_string(),
+            file: None,
+        });
+    }
+    Some(Extends {
+        service: field(node, "service")?.as_str()?.to_string(),
+        file: field(node, "file")
+            .and_then(|f| f.as_str())
+            .map(PathBuf::from),
+    })
 }
 
 /// Read an `environment:` block, which Compose accepts in two shapes.
@@ -263,6 +405,111 @@ mod tests {
             .iter()
             .map(|a| (a.key.as_str(), a.value.as_deref()))
             .collect()
+    }
+
+    #[test]
+    fn a_service_takes_the_shape_it_extends() {
+        // Verified against `docker compose config`: env files merge rather than
+        // replace, and what the extending service states wins per key.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("base.env"),
+            "SHARED_FILE=from-base-file\nONLY_BASE_FILE=b\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("own.env"), "SHARED_FILE=from-own-file\n").unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  base:\n    env_file: base.env\n    environment:\n      SHARED: from-base\n      ONLY_BASE: b\n  api:\n    extends:\n      service: base\n    env_file: own.env\n    environment:\n      SHARED: from-api\n",
+        )
+        .unwrap();
+
+        let compose = read(&dir.path().join("docker-compose.yml")).unwrap();
+        let api = compose.services.iter().find(|s| s.name == "api").unwrap();
+        // Keys keep the position they were first set at and the value last written,
+        // which is the same rule the fold uses. `docker compose config` sorts its
+        // output alphabetically, so it says nothing about order -- only about content.
+        assert_eq!(
+            pairs(api),
+            [("SHARED", Some("from-api")), ("ONLY_BASE", Some("b"))]
+        );
+        // The base's files come first, so the extending service's win.
+        let names: Vec<&str> = api
+            .env_files
+            .iter()
+            .map(|f| f.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["base.env", "own.env"]);
+    }
+
+    #[test]
+    fn an_inherited_path_hangs_off_the_file_that_wrote_it() {
+        // Verified: a `env_file: nested.env` written in config/common.yaml resolves
+        // inside config/, not beside the compose file that extends it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("config")).unwrap();
+        std::fs::write(dir.path().join("config/nested.env"), "NESTED=x\n").unwrap();
+        std::fs::write(
+            dir.path().join("config/common.yaml"),
+            "services:\n  common:\n    env_file: nested.env\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  api:\n    extends:\n      file: config/common.yaml\n      service: common\n",
+        )
+        .unwrap();
+
+        let compose = read(&dir.path().join("docker-compose.yml")).unwrap();
+        let api = &compose.services[0];
+        assert_eq!(api.env_files.len(), 1);
+        assert!(
+            api.env_files[0].path.is_file(),
+            "{:?}",
+            api.env_files[0].path
+        );
+    }
+
+    #[test]
+    fn extends_carries_through_a_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  c:\n    environment:\n      DEEP: from-c\n      LVL: c\n  b:\n    extends:\n      service: c\n    environment:\n      LVL: b\n  api:\n    extends:\n      service: b\n    environment:\n      OWN: y\n",
+        )
+        .unwrap();
+        let compose = read(&dir.path().join("docker-compose.yml")).unwrap();
+        let api = compose.services.iter().find(|s| s.name == "api").unwrap();
+        assert_eq!(
+            pairs(api),
+            [
+                ("DEEP", Some("from-c")),
+                ("LVL", Some("b")),
+                ("OWN", Some("y"))
+            ]
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_refused_rather_than_followed_forever() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  a:\n    extends:\n      service: b\n  b:\n    extends:\n      service: a\n",
+        )
+        .unwrap();
+        assert!(read(&dir.path().join("docker-compose.yml")).is_err());
+    }
+
+    #[test]
+    fn extending_something_that_is_not_there_is_an_error_not_a_silence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("docker-compose.yml"),
+            "services:\n  api:\n    extends:\n      service: nowhere\n",
+        )
+        .unwrap();
+        assert!(read(&dir.path().join("docker-compose.yml")).is_err());
     }
 
     #[test]
