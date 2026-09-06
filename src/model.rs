@@ -340,16 +340,22 @@ fn fold(
         let bound = match &assignment.value {
             Some(text) => {
                 let template = Template::parse(text);
+                let value = template
+                    .resolve(&|name| interpolation.get(name).map(|bound| bound.value.clone()));
                 Bound {
-                    value: template
-                        .resolve(&|name| interpolation.get(name).map(|bound| bound.value.clone())),
-                    origin: Origin::Inline {
-                        service: service.name.clone(),
-                    },
+                    // `via` says where the winning text was typed, so it holds only
+                    // when the variable named is what supplied it. `${DB_HOST:-x}`
+                    // over an empty DB_HOST resolves to x, and citing the `.env` line
+                    // would send a reader to a line that does not hold that value.
                     via: template
                         .sole_reference()
                         .and_then(|name| interpolation.get(name))
+                        .filter(|bound| bound.value == value)
                         .map(|bound| bound.origin.clone()),
+                    value,
+                    origin: Origin::Inline {
+                        service: service.name.clone(),
+                    },
                 }
             }
             // A bare `- KEY` is a use, never a definition: the service asks for
@@ -743,6 +749,36 @@ mod tests {
         // The service decided it, but a reader must be sent where the text is.
         assert!(matches!(bound.origin, Origin::Inline { .. }));
         assert!(matches!(bound.via, Some(Origin::Line { line: 2, .. })));
+    }
+
+    #[test]
+    fn a_fallback_branch_does_not_borrow_the_line_it_fell_back_from() {
+        // `.env:1` holds an empty DB_HOST, so the winning text came from the default,
+        // not from that line. Citing it sends the reader somewhere the value is not.
+        let (_dir, project) = project(&[
+            (".env", "DB_HOST=\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    environment:\n      HOST: ${DB_HOST:-the-fallback}\n",
+            ),
+        ]);
+        let bound = &var(service(&project, "api"), "HOST").bound;
+        assert_eq!(bound.value, Value::Literal("the-fallback".into()));
+        assert!(bound.via.is_none(), "{:?}", bound.via);
+    }
+
+    #[test]
+    fn an_alternate_branch_does_not_borrow_a_line_either() {
+        let (_dir, project) = project(&[
+            (".env", "FLAG=on\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    environment:\n      MODE: ${FLAG:+enabled}\n",
+            ),
+        ]);
+        let bound = &var(service(&project, "api"), "MODE").bound;
+        assert_eq!(bound.value, Value::Literal("enabled".into()));
+        assert!(bound.via.is_none(), "{:?}", bound.via);
     }
 
     #[test]

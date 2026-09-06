@@ -45,6 +45,11 @@ pub fn read(path: &Path) -> Result<Document> {
 /// Deliberately forgiving: envwire reports on projects it did not write, and a
 /// parser that gives up on the first odd line would report a whole file as missing.
 pub fn parse(text: &str) -> Document {
+    // A file written on Windows opens with a byte order mark. Docker reads straight
+    // past it (verified), so treating it as part of the first key loses a variable
+    // the container really gets and reports every use of it as undefined.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+
     let mut doc = Document::default();
     let lines: Vec<&str> = text.lines().collect();
     let mut index = 0;
@@ -353,6 +358,22 @@ mod tests {
     #[test]
     fn carriage_returns_do_not_end_up_in_values() {
         assert_eq!(values("KEY=value\r\nOTHER=2\r\n")[0].1, "value");
+    }
+
+    #[test]
+    fn a_byte_order_mark_does_not_eat_the_first_key() {
+        // A .env written on Windows starts with one. Docker reads straight past it
+        // (verified), so filing that line as unreadable loses a key the container
+        // really gets, and reports every use of it as undefined.
+        let doc = parse("\u{feff}FIRST=survives\nSECOND=ok\n");
+        assert_eq!(
+            values("\u{feff}FIRST=survives\nSECOND=ok\n"),
+            [
+                ("FIRST".into(), "survives".into()),
+                ("SECOND".into(), "ok".into())
+            ]
+        );
+        assert!(doc.malformed.is_empty(), "{:?}", doc.malformed);
     }
 
     #[test]
