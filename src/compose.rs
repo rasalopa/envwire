@@ -594,6 +594,29 @@ mod tests {
     }
 
     #[test]
+    fn a_yaml_number_is_where_envwire_and_docker_can_part_ways() {
+        // Pinned deliberately, because a check that compares values must not trust
+        // these. Verified with `docker compose config`: Docker hands the container
+        // `0755` as "493" (it reads the leading zero as octal) and `1.10` as "1.1",
+        // while yaml-rust2 reads YAML 1.2 and gives "755" and "1.10".
+        //
+        // envwire cannot tell which side is which from the parsed value alone, so a
+        // comparison must stay silent on numbers rather than report a difference it
+        // cannot stand behind.
+        let service = only_service(
+            "services:\n  api:\n    environment:\n      OCTALISH: 0755\n      FLOATY: 1.10\n      HEXY: 0x1F\n",
+        );
+        assert_eq!(
+            pairs(&service),
+            [
+                ("OCTALISH", Some("755")),
+                ("FLOATY", Some("1.10")),
+                ("HEXY", Some("31"))
+            ]
+        );
+    }
+
+    #[test]
     fn a_quoted_number_keeps_every_digit() {
         let service = only_service("services:\n  api:\n    environment:\n      PORT: \"0755\"\n");
         assert_eq!(pairs(&service), [("PORT", Some("0755"))]);

@@ -106,6 +106,45 @@ pub fn documented(project: &Project) -> Vec<Finding> {
     findings
 }
 
+/// A key one file sets more than once, where every assignment but the last is dead.
+///
+/// Not the same as `.env.local` overriding `.env`: overriding across files is what
+/// those files are for. Twice in one file is a line somebody edited to no effect.
+///
+/// Deliberately says nothing about which value won -- see `Value::disclosure`.
+pub fn set_twice(project: &Project) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for file in &project.files {
+        for setting in &file.settings {
+            let Some(last) = file
+                .settings
+                .iter()
+                .rev()
+                .find(|other| other.key == setting.key)
+            else {
+                continue;
+            };
+            // Only the assignments that lose are worth a word; the last one stands.
+            if last.line == setting.line {
+                continue;
+            }
+            findings.push(Finding {
+                weight: Weight::Problem,
+                what: format!(
+                    "{} is set again at line {}, so this line changes nothing",
+                    setting.key, last.line
+                ),
+                at: Origin::Line {
+                    path: file.path.clone(),
+                    line: setting.line,
+                },
+                because: None,
+            });
+        }
+    }
+    findings
+}
+
 /// Addresses that mean "this very container" once a service is running in one.
 ///
 /// `0.0.0.0` is deliberately absent: inside a container it is the correct address to
@@ -395,6 +434,63 @@ mod tests {
             ),
         ]);
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    fn dupes(files: &[(&str, &str)]) -> (TempDir, Vec<Finding>) {
+        let dir = tempdir().unwrap();
+        for (name, body) in files {
+            fs::write(dir.path().join(name), body).unwrap();
+        }
+        let project = model::read(&sources::discover(dir.path())).unwrap();
+        let found = set_twice(&project);
+        (dir, found)
+    }
+
+    #[test]
+    fn a_key_set_twice_in_one_file_is_a_problem() {
+        // Real: `ALLOW_PRIVATE_TARGETS` was written twice in one project's `.env`,
+        // lines 9 and 24. Whoever edited the first one changed nothing.
+        let (_dir, found) = dupes(&[(".env", "A=1\nB=2\nA=3\n")]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].weight, Weight::Problem);
+        assert!(found[0].what.contains('A'), "{}", found[0].what);
+        // Points at the line that has no effect, not the one that wins.
+        assert!(matches!(found[0].at, Origin::Line { line: 1, .. }));
+        assert!(found[0].what.contains('3') || found[0].because.is_some());
+    }
+
+    #[test]
+    fn three_of_the_same_key_report_the_two_that_lose() {
+        let (_dir, found) = dupes(&[(".env", "A=1\nA=2\nA=3\n")]);
+        assert_eq!(found.len(), 2, "{found:?}");
+    }
+
+    #[test]
+    fn a_key_set_once_in_each_of_two_files_is_not_a_duplicate() {
+        // `.env.local` overriding `.env` is the whole point of that file.
+        let (_dir, found) = dupes(&[(".env", "A=1\n"), (".env.local", "A=2\n")]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_example_file_is_held_to_the_same_rule() {
+        let (_dir, found) = dupes(&[(".env.example", "A=\nA=\n")]);
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn a_pass_through_beside_an_assignment_still_counts() {
+        let (_dir, found) = dupes(&[(".env", "TOKEN\nTOKEN=value\n")]);
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn no_duplicate_finding_carries_a_value() {
+        let (_dir, found) = dupes(&[(".env", "SECRET=first-hunter2\nSECRET=second-hunter2\n")]);
+        for finding in &found {
+            let said = format!("{} {:?}", finding.what, finding.because);
+            assert!(!said.contains("hunter2"), "leaked: {said}");
+        }
     }
 
     #[test]
