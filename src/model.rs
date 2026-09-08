@@ -146,6 +146,9 @@ pub struct Var {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceEnv {
     pub name: String,
+    /// Set when the container does not own its network stack, so loopback there
+    /// reaches something other than itself.
+    pub network_mode: Option<String>,
     /// Keys in the order they were first set, values as last written. Losers are
     /// dropped: reporting a value that something downstream overrides is a false
     /// positive by construction.
@@ -258,6 +261,7 @@ fn fold(
 ) -> ServiceEnv {
     let mut env = ServiceEnv {
         name: service.name.clone(),
+        network_mode: service.network_mode.clone(),
         vars: Vec::new(),
         sources: Vec::new(),
         gaps: Vec::new(),

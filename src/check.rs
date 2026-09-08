@@ -158,6 +158,14 @@ const LOOPBACK: &[&str] = &["localhost", "127.0.0.1", "::1"];
 /// a real project where a rule without this list reported both as bugs.
 const BROWSER_FACING: &[&str] = &["PUBLIC", "CORS", "ORIGIN", "BROWSER"];
 
+/// Key endings that can only mean the address this container dials.
+///
+/// `ENDPOINT` and `URL` are deliberately absent. `MINIO_ENDPOINT` is a dial target and
+/// `MINIO_EXTERNAL_ENDPOINT` is a browser's address, and they differ by one word that
+/// could have been anything -- envwire cannot tell them apart from a name, so it says
+/// nothing about either. A connection string still speaks through its scheme.
+const ADDRESS_SLOT: &[&str] = &["HOST", "HOSTNAME", "ADDR", "ADDRESS"];
+
 /// A service told to reach its neighbour at loopback, which is itself.
 ///
 /// Narrow on purpose. Most loopback values a container receives are correct, so the
@@ -174,6 +182,12 @@ pub fn reachable(project: &Project) -> Vec<Finding> {
 
     let mut findings = Vec::new();
     for service in &project.services {
+        // A container that does not own its network stack reaches something real at
+        // loopback: `network_mode: service:redis` shares redis's namespace, and on the
+        // host network loopback is the host. Verified by running both.
+        if service.network_mode.is_some() {
+            continue;
+        }
         for var in &service.vars {
             // Something unread could still overrule this, so there is nothing to say.
             if !service.settled(var) {
@@ -189,7 +203,7 @@ pub fn reachable(project: &Project) -> Vec<Finding> {
             if !LOOPBACK.contains(&host) {
                 continue;
             }
-            let Some(meant) = neighbour(&var.key, text, &services) else {
+            let Some(meant) = neighbour(&var.key, text, &service.name, &services) else {
                 continue;
             };
 
@@ -224,17 +238,32 @@ fn browser_facing(key: &str) -> bool {
 /// service (`REDIS_HOST` beside a `redis`), or the URL scheme does
 /// (`postgres://...` beside a `postgres`). Without one of them there is nothing but a
 /// guess, and a guess here is the expensive kind of wrong.
-fn neighbour<'a>(key: &str, value: &str, services: &[&'a str]) -> Option<&'a str> {
+fn neighbour<'a>(key: &str, value: &str, asker: &str, services: &[&'a str]) -> Option<&'a str> {
+    let segments: Vec<&str> = key.split('_').collect();
+    let addresses = segments.last().is_some_and(|last| {
+        ADDRESS_SLOT
+            .iter()
+            .any(|slot| last.eq_ignore_ascii_case(slot))
+    });
+
     // Whole segments only. A service named `db` is not named by `SANDBOX_URL`, even
     // though those letters appear in it.
     let named = |candidate: &str| {
-        key.split('_')
-            .any(|part| part.eq_ignore_ascii_case(candidate))
+        (addresses
+            && segments
+                .iter()
+                .any(|part| part.eq_ignore_ascii_case(candidate)))
             || value
                 .split_once("://")
                 .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case(candidate))
     };
-    services.iter().copied().find(|service| named(service))
+    // A service naming itself is no evidence of a neighbour: loopback inside the redis
+    // container really is redis.
+    services
+        .iter()
+        .copied()
+        .filter(|service| *service != asker)
+        .find(|service| named(service))
 }
 
 /// The host a value points at, when it points at one.
@@ -312,6 +341,83 @@ mod tests {
         let project = model::read(&sources::discover(dir.path())).unwrap();
         let found = reachable(&project);
         (dir, found)
+    }
+
+    #[test]
+    fn a_service_naming_itself_is_no_evidence_of_a_neighbour() {
+        // 127.0.0.1 inside the redis container really is redis. Proven by running it:
+        // the healthcheck that dials $REDIS_HOST reports the container healthy.
+        let (_dir, found) = reach(&[(
+            "docker-compose.yml",
+            "services:\n  redis:\n    image: redis\n    environment:\n      REDIS_HOST: 127.0.0.1\n  api:\n    image: node\n",
+        )]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_service_sharing_another_namespace_is_left_alone() {
+        // `network_mode: service:redis` puts both containers on one network stack, so
+        // 127.0.0.1 is exactly how api must reach redis. Verified by running it: both
+        // `redis-cli -h 127.0.0.1` and `-h redis` answer PONG.
+        let (_dir, found) = reach(&[(
+            "docker-compose.yml",
+            "services:\n  redis:\n    image: redis\n  api:\n    image: node\n    network_mode: \"service:redis\"\n    environment:\n      REDIS_HOST: 127.0.0.1\n",
+        )]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_service_on_the_host_network_is_left_alone() {
+        let (_dir, found) = reach(&[(
+            "docker-compose.yml",
+            "services:\n  redis:\n    image: redis\n  api:\n    image: node\n    network_mode: host\n    environment:\n      REDIS_HOST: localhost\n",
+        )]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn only_a_slot_that_plainly_means_an_address_fires_on_the_key() {
+        // `MINIO_EXTERNAL_ENDPOINT` and `MINIO_PUBLIC_ENDPOINT` are the same variable
+        // with one word changed, and both are read by a browser. envwire cannot tell
+        // a dial target from a published address by name, so only the slots that mean
+        // nothing else -- HOST, HOSTNAME, ADDR, ADDRESS -- speak.
+        for key in ["MINIO_EXTERNAL_ENDPOINT", "FRONTEND_URL", "KEYCLOAK_ISSUER"] {
+            let (_dir, found) = reach(&[(
+                "docker-compose.yml",
+                &format!(
+                    "services:\n  minio:\n    image: minio\n  frontend:\n    image: node\n  keycloak:\n    image: kc\n  api:\n    image: node\n    environment:\n      {key}: http://localhost:9000\n"
+                ),
+            )]);
+            assert!(found.is_empty(), "{key} should be silent: {found:?}");
+        }
+    }
+
+    #[test]
+    fn an_address_slot_beside_its_service_still_fires() {
+        for key in [
+            "REDIS_HOST",
+            "REDIS_HOSTNAME",
+            "REDIS_ADDR",
+            "REDIS_ADDRESS",
+        ] {
+            let (_dir, found) = reach(&[(
+                "docker-compose.yml",
+                &format!(
+                    "services:\n  redis:\n    image: redis\n  api:\n    image: node\n    environment:\n      {key}: localhost\n"
+                ),
+            )]);
+            assert_eq!(found.len(), 1, "{key} should fire: {found:?}");
+        }
+    }
+
+    #[test]
+    fn a_connection_string_still_fires_whatever_the_key_is_called() {
+        // A scheme is unambiguous evidence of dialling, so the key need not be a slot.
+        let (_dir, found) = reach(&[(
+            "docker-compose.yml",
+            "services:\n  postgres:\n    image: postgres\n  api:\n    image: node\n    environment:\n      SOMETHING_ELSE: postgres://u:p@localhost:5432/app\n",
+        )]);
+        assert_eq!(found.len(), 1, "{found:?}");
     }
 
     #[test]

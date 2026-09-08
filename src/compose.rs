@@ -63,6 +63,12 @@ pub struct Service {
     pub name: String,
     /// What this service inherits. Always `None` after [`read`] has folded it in.
     pub extends: Option<Extends>,
+    /// `network_mode:`, when the service sets one.
+    ///
+    /// `service:other` and `host` both put the container on a network stack it does
+    /// not own, and loopback there reaches something real. A check about who a
+    /// container can talk to has nothing true to say about such a service.
+    pub network_mode: Option<String>,
     /// Set inline, in file order. Repeats are kept; which one wins is a finding.
     pub environment: Vec<Assignment>,
     pub env_files: Vec<EnvFileRef>,
@@ -136,6 +142,7 @@ fn flatten(
     let mut whole = Service {
         name: service.name.clone(),
         extends: None,
+        network_mode: service.network_mode.clone(),
         environment: Vec::new(),
         env_files: Vec::new(),
     };
@@ -161,6 +168,7 @@ fn flatten(
             .clone();
 
         let inherited = flatten(&base, &base_path, files, chain)?;
+        whole.network_mode = whole.network_mode.take().or(inherited.network_mode);
         whole.env_files.extend(inherited.env_files);
         whole.environment.extend(inherited.environment);
     }
@@ -211,6 +219,9 @@ pub fn parse(text: &str) -> std::result::Result<Compose, String> {
         compose.services.push(Service {
             name: name.to_string(),
             extends: field(body, "extends").and_then(extends_of),
+            network_mode: field(body, "network_mode")
+                .and_then(|node| node.as_str())
+                .map(str::to_string),
             environment: field(body, "environment").map_or_else(Vec::new, environment_of),
             env_files: field(body, "env_file").map_or_else(Vec::new, env_files_of),
         });
