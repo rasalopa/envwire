@@ -543,6 +543,12 @@ fn interpolation_of(files: &[EnvFile]) -> Interpolation {
 fn scan(raw: &str, path: &Path) -> Vec<Reference> {
     let mut references = Vec::new();
     for (index, line) in raw.lines().enumerate() {
+        // A commented-out line is not a use. Docker never reads it, and counting it
+        // both invents a default for a key nothing uses and, the other way round,
+        // makes a key look used when only a dead line names it.
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
         let mut uses: Vec<Use> = Vec::new();
         Template::parse(line).uses(&mut uses);
         for used in uses {

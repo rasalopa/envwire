@@ -36,12 +36,23 @@ pub struct Finding {
 /// is running the tool, even though Compose never opens that file, and an example
 /// file promises regardless of whether any service reads it.
 pub fn documented(project: &Project) -> Vec<Finding> {
-    let held: BTreeSet<&str> = keys(project, SourceKind::Env).collect();
-    if held.is_empty() && !project.files.iter().any(|f| f.kind == SourceKind::Env) {
-        // A project with only an example is unconfigured, not drifting. Saying every
-        // promised key is missing would be true and useless.
+    // A project with only an example is unconfigured, not drifting. Saying every
+    // promised key is missing would be true and useless.
+    if !project.files.iter().any(|f| f.kind == SourceKind::Env) {
         return Vec::new();
     }
+
+    let mut held: BTreeSet<&str> = keys(project, SourceKind::Env).collect();
+    // A key a container is really handed is set, wherever it came from. The file
+    // supplying it need not be a `.env`, and sending a reader to hunt for a variable
+    // their service already receives is the kind of wrong that gets a linter muted.
+    held.extend(
+        project
+            .services
+            .iter()
+            .flat_map(|service| service.vars.iter())
+            .map(|var| var.key.as_str()),
+    );
     let promised: BTreeSet<&str> = keys(project, SourceKind::Example).collect();
 
     let mut findings = Vec::new();
@@ -116,11 +127,16 @@ pub fn set_twice(project: &Project) -> Vec<Finding> {
     let mut findings = Vec::new();
     for file in &project.files {
         for setting in &file.settings {
+            // A bare pass-through is a request, not an assignment: unanswered, Docker
+            // drops it and the line above stays alive. Only a real assignment wins.
+            if setting.value.is_none() {
+                continue;
+            }
             let Some(last) = file
                 .settings
                 .iter()
                 .rev()
-                .find(|other| other.key == setting.key)
+                .find(|other| other.key == setting.key && other.value.is_some())
             else {
                 continue;
             };
@@ -585,9 +601,13 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_through_beside_an_assignment_still_counts() {
-        let (_dir, found) = dupes(&[(".env", "TOKEN\nTOKEN=value\n")]);
-        assert_eq!(found.len(), 1, "{found:?}");
+    fn a_pass_through_beside_an_assignment_is_not_a_duplicate() {
+        // Neither order is a key assigned twice: a bare name asks for a value and an
+        // assignment gives one. Only two assignments make one of them dead.
+        for text in ["TOKEN\nTOKEN=value\n", "TOKEN=value\nTOKEN\n"] {
+            let (_dir, found) = dupes(&[(".env", text)]);
+            assert!(found.is_empty(), "{text:?}: {found:?}");
+        }
     }
 
     #[test]
@@ -597,6 +617,59 @@ mod tests {
             let said = format!("{} {:?}", finding.what, finding.because);
             assert!(!said.contains("hunter2"), "leaked: {said}");
         }
+    }
+
+    #[test]
+    fn a_key_a_container_is_handed_counts_as_set() {
+        // The env file supplying it is not a `.env`, but the service really receives
+        // it, so calling it "not set anywhere" sends a reader hunting for nothing.
+        let (_dir, found) = findings(&[
+            (".env", "A=1\n"),
+            ("svc.env", "SUPPLIED=yes\n"),
+            (".env.example", "A=\nSUPPLIED=\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    env_file: svc.env\n",
+            ),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_key_set_inline_in_compose_counts_as_set_too() {
+        let (_dir, found) = findings(&[
+            (".env", "A=1\n"),
+            (".env.example", "A=\nINLINE=\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    environment:\n      INLINE: yes\n",
+            ),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_commented_out_reference_is_not_a_use() {
+        // Docker never reads a commented line, so counting it invents a default for a
+        // key nothing uses -- turning a real Problem into a Note.
+        let (_dir, found) = findings(&[
+            (".env", "A=1\n"),
+            (".env.example", "A=\nGONE=\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  api:\n    image: node\n#     GONE: ${GONE:-fallback}\n",
+            ),
+        ]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].weight, Weight::Problem, "{found:?}");
+    }
+
+    #[test]
+    fn a_bare_pass_through_does_not_kill_the_assignment_above_it() {
+        // A bare name is a request. Unanswered, Docker drops it and the earlier
+        // assignment stands, so that earlier line is very much alive.
+        let (_dir, found) = dupes(&[(".env", "TOKEN=real\nTOKEN\n")]);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]
@@ -620,14 +693,18 @@ mod tests {
 
     #[test]
     fn a_promised_key_compose_always_defaults_is_only_a_note() {
-        // The service starts without it, so calling it a problem buries the ones that
+        // The project starts without it, so calling it a problem buries the ones that
         // really are. Taken from a real project where 18 of 24 looked like this.
+        //
+        // The reference sits outside `environment:` on purpose: a key a service is
+        // handed is held outright and says nothing at all, so the softened Note is for
+        // the keys Compose reads somewhere else -- an image tag, a port, a volume.
         let (_dir, found) = findings(&[
             (".env", "A=1\n"),
-            (".env.example", "A=\nSMTP_HOST=\n"),
+            (".env.example", "A=\nTAG=\n"),
             (
                 "docker-compose.yml",
-                "services:\n  api:\n    environment:\n      SMTP_HOST: ${SMTP_HOST:-mail}\n",
+                "services:\n  api:\n    image: app:${TAG:-latest}\n",
             ),
         ]);
         assert_eq!(found.len(), 1);
@@ -639,13 +716,13 @@ mod tests {
     fn one_use_without_a_default_is_enough_to_make_it_a_problem() {
         let (_dir, found) = findings(&[
             (".env", "A=1\n"),
-            (".env.example", "A=\nHOST=\n"),
+            (".env.example", "A=\nTAG=\n"),
             (
                 "docker-compose.yml",
-                "services:\n  api:\n    environment:\n      X: ${HOST:-safe}\n      Y: ${HOST}\n",
+                "services:\n  api:\n    image: app:${TAG:-latest}\n    volumes:\n      - ${TAG}:/data\n",
             ),
         ]);
-        assert_eq!(found[0].weight, Weight::Problem);
+        assert_eq!(found[0].weight, Weight::Problem, "{found:?}");
     }
 
     #[test]
