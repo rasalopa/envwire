@@ -444,7 +444,7 @@ fn settings_of(doc: dotenv::Document, kind: SourceKind) -> (Vec<Setting>, Vec<Ma
             malformed.push(bad);
             continue;
         }
-        if dotenv::is_name(&bad.text) {
+        if written_as_a_name(&bad.text) {
             settings.push(Setting {
                 key: bad.text.clone(),
                 value: None,
@@ -463,6 +463,23 @@ fn settings_of(doc: dotenv::Document, kind: SourceKind) -> (Vec<Setting>, Vec<Ma
 
     settings.sort_by_key(|setting| setting.line);
     (settings, malformed)
+}
+
+/// Whether an unreadable line is plausibly somebody asking for a variable.
+///
+/// `is_name` alone is too generous here. A base64 body line passes it, so a blob
+/// pasted into a `.env` gets recovered as a pass-through and then PRINTED as a
+/// variable name -- which put real private-key bytes on stdout before this existed.
+///
+/// Nobody writes a variable name in mixed case, and every base64 line is mixed. The
+/// cost of being wrong in each direction is not equal: declining to recover a real
+/// `MyVar` costs silence, while recovering a key line costs the secret.
+fn written_as_a_name(text: &str) -> bool {
+    if !dotenv::is_name(text) {
+        return false;
+    }
+    let letters = || text.chars().filter(|c| c.is_ascii_alphabetic());
+    !(letters().any(|c| c.is_ascii_uppercase()) && letters().any(|c| c.is_ascii_lowercase()))
 }
 
 /// Read `NAME: value` by swapping the delimiter and letting dotenv.rs do the rest.
@@ -912,6 +929,35 @@ mod tests {
         ]);
         let api = service(&project, "api");
         assert!(api.vars.iter().all(|v| v.key != "NEVER_ASKED_FOR"));
+    }
+
+    #[test]
+    fn an_unreadable_line_that_is_not_a_name_anyone_writes_is_not_recovered() {
+        // The line below passes `is_name`, and recovering it meant printing it as a
+        // variable name. It is a base64 body line, and no one names a variable that.
+        let (_dir, project) = project(&[(
+            ".env",
+            "GOOD=1\nMIIEowIBAAKCAQEAwR3nOgvCFqRSIrOOMcbLbpBhqmVjSMwYYq9RcVDd\nPASS_THROUGH\n",
+        )]);
+        let keys: Vec<&str> = project.files[0]
+            .settings
+            .iter()
+            .map(|s| s.key.as_str())
+            .collect();
+        assert_eq!(keys, ["GOOD", "PASS_THROUGH"]);
+        // It stays on the books as unreadable, which is honest.
+        assert_eq!(project.files[0].malformed.len(), 1);
+    }
+
+    #[test]
+    fn a_lowercase_pass_through_is_still_recovered() {
+        let (_dir, project) = project(&[(".env", "lower_case_name\nUPPER_NAME\n")]);
+        let keys: Vec<&str> = project.files[0]
+            .settings
+            .iter()
+            .map(|s| s.key.as_str())
+            .collect();
+        assert_eq!(keys, ["lower_case_name", "UPPER_NAME"]);
     }
 
     #[test]

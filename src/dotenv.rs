@@ -102,6 +102,10 @@ pub fn parse(text: &str) -> Document {
     doc
 }
 
+/// How an armoured block opens and closes. PEM spells both the same way.
+const BLOCK_OPEN: &str = "-----BEGIN";
+const BLOCK_CLOSE: &str = "-----END";
+
 /// Whether `name` can be an environment variable name.
 pub(crate) fn is_name(name: &str) -> bool {
     let mut chars = name.chars();
@@ -117,6 +121,23 @@ pub(crate) fn is_name(name: &str) -> bool {
 /// Returns the value and how many extra lines it swallowed.
 fn read_value(first: &str, rest: &[&str]) -> (String, usize) {
     let start = first.trim_start();
+
+    // An armoured block -- a PEM key or certificate -- is routinely pasted in without
+    // quotes. Read one line at a time its body becomes unreadable lines, which then
+    // get recovered as names and printed as names, putting key bytes on CI stdout.
+    if start.starts_with(BLOCK_OPEN) && !start.contains(BLOCK_CLOSE) {
+        let mut block = String::from(start);
+        for (taken, line) in rest.iter().enumerate() {
+            block.push('\n');
+            block.push_str(line);
+            if line.contains(BLOCK_CLOSE) {
+                return (block, taken + 1);
+            }
+        }
+        // No terminator: the file is truncated, so keep the one line rather than
+        // swallowing everything after it.
+        return (unquoted(first), 0);
+    }
 
     let Some(quote) = start.chars().next().filter(|c| *c == '"' || *c == '\'') else {
         return (unquoted(first), 0);
@@ -358,6 +379,29 @@ mod tests {
     #[test]
     fn carriage_returns_do_not_end_up_in_values() {
         assert_eq!(values("KEY=value\r\nOTHER=2\r\n")[0].1, "value");
+    }
+
+    #[test]
+    fn an_unquoted_key_block_is_one_value_not_a_pile_of_lines() {
+        // A PEM key pasted into a `.env` without quotes is common. Read line by line,
+        // its body lands in `malformed`, and every line that happens to look like a
+        // name gets recovered and later PRINTED as one -- putting private key bytes
+        // on CI stdout. Reproduced with a real 2048-bit key before this was written.
+        let doc = parse(
+            "KEY=-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAwR3nOgvCFqRS\nkLzWzZqPqYbxTgUuPrivateMaterial\n-----END RSA PRIVATE KEY-----\nAFTER=fine\n",
+        );
+        assert!(doc.malformed.is_empty(), "{:?}", doc.malformed);
+        assert_eq!(doc.entries.len(), 2);
+        assert_eq!(doc.entries[0].key, "KEY");
+        assert!(doc.entries[0].value.contains("BEGIN RSA"));
+        assert!(doc.entries[0].value.contains("END RSA"));
+        assert_eq!(doc.entries[1].key, "AFTER");
+    }
+
+    #[test]
+    fn a_block_that_never_ends_does_not_eat_the_file() {
+        let doc = parse("KEY=-----BEGIN CERTIFICATE-----\nbody\nAFTER=fine\n");
+        assert!(doc.entries.iter().any(|e| e.key == "AFTER"), "{doc:?}");
     }
 
     #[test]
