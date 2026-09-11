@@ -288,7 +288,7 @@ fn fold(
         let layer = Layer::EnvFile(index);
         let read = match cache.get(&path) {
             Some(read) => read.clone(),
-            None => match read_env_file(&path) {
+            None => match read_env_file(&path, interpolation) {
                 Some(read) => {
                     cache.insert(path.clone(), read.clone());
                     read
@@ -412,11 +412,18 @@ struct ReadFile {
 /// An env file Compose reads is an env file, so it gets the same forgiveness a `.env`
 /// does. Its values are scanned as well as parsed: Docker interpolates them against
 /// the project `.env`, so a `${BASE}` in one is a real use of BASE.
-fn read_env_file(path: &Path) -> Option<ReadFile> {
+fn read_env_file(path: &Path, interpolation: &Interpolation) -> Option<ReadFile> {
     let text = std::fs::read_to_string(path).ok()?;
     let (settings, _) = settings_of(dotenv::parse(&text), SourceKind::Env);
+    // Only a name the project `.env` answers is kept. A `$` inside a password makes
+    // the text after it look like a reference, and reporting that name would print a
+    // piece of the password -- which is how a secret reaches a CI log.
+    let references = scan(&text, path)
+        .into_iter()
+        .filter(|reference| interpolation.get(&reference.name).is_some())
+        .collect();
     Some(ReadFile {
-        references: scan(&text, path),
+        references,
         settings,
     })
 }

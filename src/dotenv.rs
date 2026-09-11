@@ -131,8 +131,17 @@ pub(crate) fn written_as_a_name(name: &str) -> bool {
         return false;
     }
     let letters = || name.chars().filter(|c| c.is_ascii_alphabetic());
-    !(letters().any(|c| c.is_ascii_uppercase()) && letters().any(|c| c.is_ascii_lowercase()))
+    if letters().any(|c| c.is_ascii_uppercase()) && letters().any(|c| c.is_ascii_lowercase()) {
+        return false;
+    }
+    // A blob can land in one case by chance, so case alone does not settle it. What
+    // people write is either short or jointed: `GOOGLE_APPLICATION_CREDENTIALS` is
+    // long but built of words, and an unbroken 35-character run is not a name.
+    name.contains('_') || name.chars().count() <= LONGEST_UNJOINTED
 }
+
+/// How long a name with no underscore in it may be.
+const LONGEST_UNJOINTED: usize = 24;
 
 /// Resolve the value that starts at `first`, borrowing `rest` when a quote stays open.
 ///
@@ -397,6 +406,22 @@ mod tests {
     #[test]
     fn carriage_returns_do_not_end_up_in_values() {
         assert_eq!(values("KEY=value\r\nOTHER=2\r\n")[0].1, "value");
+    }
+
+    #[test]
+    fn a_long_run_of_letters_with_no_underscore_is_not_a_name() {
+        // The mixed-case rule alone is not enough: a base64 line can land in one case
+        // by chance, and then its `=` padding makes it an assignment. Names people
+        // write are either short or jointed; a 35-character unbroken run is neither.
+        let doc = parse("APP=demo\nMIIEVWIQADANBGKQHKIGSECRETUPPERONLY==\n");
+        let keys: Vec<&str> = doc.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["APP"]);
+    }
+
+    #[test]
+    fn a_long_name_with_joints_is_still_a_name() {
+        let doc = parse("GOOGLE_APPLICATION_CREDENTIALS=/x\nNEXT_PUBLIC_SUPABASE_ANON_KEY=y\n");
+        assert_eq!(doc.entries.len(), 2, "{doc:?}");
     }
 
     #[test]
