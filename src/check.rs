@@ -161,6 +161,163 @@ pub fn set_twice(project: &Project) -> Vec<Finding> {
     findings
 }
 
+/// Key endings that say the value is a secret, whatever came before them.
+///
+/// The ending is what names a variable's job. `ALLOW_PRIVATE_TARGETS` holds PRIVATE as
+/// a whole segment and is a boolean flag -- real, from a project that would have been
+/// reported by anything matching anywhere in the name.
+const SECRET_ENDING: &[&str] = &[
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PASSPHRASE",
+    "TOKEN",
+    "CREDENTIAL",
+    "CREDENTIALS",
+];
+
+/// Endings of two words, where `KEY` alone would sweep up `SORT_KEY` and `CACHE_KEY`.
+const SECRET_KEY_ENDING: &[&str] = &[
+    "SECRET",
+    "API",
+    "PRIVATE",
+    "ENCRYPTION",
+    "APP",
+    "SIGNING",
+    "MASTER",
+];
+
+/// Values that are a way of saying "nothing is set here".
+///
+/// Laravel writes `REDIS_PASSWORD=null`; a reader means no password, not a weak one.
+/// Calling that a weak secret is wrong twice -- it is not a secret value, and "unset"
+/// is a different complaint that deserves its own words.
+const NOT_A_SECRET_VALUE: &[&str] = &[
+    "null",
+    "none",
+    "nil",
+    "undefined",
+    "false",
+    "true",
+    "yes",
+    "no",
+    "off",
+    "on",
+];
+
+/// Values somebody meant to replace and did not.
+const LEFT_AS_WRITTEN: &[&str] = &[
+    "changeme",
+    "change-me",
+    "change_me",
+    "change-me-in-prod",
+    "changethis",
+    "secret",
+    "password",
+    "admin",
+    "test",
+    "example",
+    "placeholder",
+    "your-secret-here",
+];
+
+/// Below this a secret is guessable by any modern standard.
+const SHORT: usize = 16;
+
+/// A secret left at its placeholder, or short enough to guess.
+///
+/// Never says the value. A finding that quotes the secret it is complaining about puts
+/// it in a CI log, which is the thing this tool exists not to do.
+///
+/// Example files are exempt: a short value there is the point of the file.
+pub fn weak_secrets(project: &Project) -> Vec<Finding> {
+    let mut findings = Vec::new();
+
+    let mut judge = |key: &str, value: &Value, at: Origin| {
+        if !names_a_secret(key) {
+            return;
+        }
+        // A pass-through, a `${VAULT_TOKEN}` and an empty value are rejected together:
+        // envwire is not holding a secret to judge in any of the three.
+        let Value::Literal(text) = value else { return };
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let plain = text.to_ascii_lowercase();
+        if NOT_A_SECRET_VALUE.contains(&plain.as_str()) || text.chars().all(|c| c.is_ascii_digit())
+        {
+            return;
+        }
+
+        if LEFT_AS_WRITTEN.contains(&plain.as_str()) {
+            findings.push(Finding {
+                weight: Weight::Problem,
+                what: format!("{key} is still set to a placeholder"),
+                at,
+                because: None,
+            });
+        } else if text.chars().count() < SHORT {
+            findings.push(Finding {
+                // Short is a judgement, not a breakage. A developer may mean it on
+                // their own machine, and it should not fail anybody's build alone.
+                weight: Weight::Note,
+                what: format!("{key} is shorter than {SHORT} characters"),
+                at,
+                because: None,
+            });
+        }
+    };
+
+    for file in project.files.iter().filter(|f| f.kind == SourceKind::Env) {
+        for setting in &file.settings {
+            let Some(value) = &setting.value else {
+                continue;
+            };
+            judge(
+                &setting.key,
+                value,
+                Origin::Line {
+                    path: file.path.clone(),
+                    line: setting.line,
+                },
+            );
+        }
+    }
+
+    // A secret typed into the Compose file is worse than a short one in a `.env` the
+    // repository ignores: this one is committed.
+    for service in &project.services {
+        for var in &service.vars {
+            if !matches!(var.bound.origin, Origin::Inline { .. }) || var.bound.via.is_some() {
+                continue;
+            }
+            judge(&var.key, &var.bound.value, var.bound.origin.clone());
+        }
+    }
+
+    findings
+}
+
+/// Whether the key's ending says its value is a secret.
+fn names_a_secret(key: &str) -> bool {
+    let segments: Vec<String> = key.split('_').map(|s| s.to_ascii_uppercase()).collect();
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    if SECRET_ENDING.contains(&last.as_str()) {
+        return true;
+    }
+    // `KEY` on its own sweeps up `SORT_KEY` and `PRIMARY_KEY`, so it needs a word in
+    // front of it that can only mean a secret.
+    last == "KEY"
+        && segments
+            .len()
+            .checked_sub(2)
+            .and_then(|i| segments.get(i))
+            .is_some_and(|before| SECRET_KEY_ENDING.contains(&before.as_str()))
+}
+
 /// Addresses that mean "this very container" once a service is running in one.
 ///
 /// `0.0.0.0` is deliberately absent: inside a container it is the correct address to
@@ -670,6 +827,102 @@ mod tests {
         // assignment stands, so that earlier line is very much alive.
         let (_dir, found) = dupes(&[(".env", "TOKEN=real\nTOKEN\n")]);
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    fn secrets(files: &[(&str, &str)]) -> (TempDir, Vec<Finding>) {
+        let dir = tempdir().unwrap();
+        for (name, body) in files {
+            fs::write(dir.path().join(name), body).unwrap();
+        }
+        let project = model::read(&sources::discover(dir.path())).unwrap();
+        let found = weak_secrets(&project);
+        (dir, found)
+    }
+
+    #[test]
+    fn a_secret_left_at_its_placeholder_is_a_problem() {
+        let (_dir, found) = secrets(&[(".env", "JWT_SECRET=change-me-in-prod\n")]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].weight, Weight::Problem);
+    }
+
+    #[test]
+    fn a_short_secret_is_only_a_note() {
+        // Short is a judgement, not a breakage: a dev machine may mean it. It should
+        // never fail somebody's build on its own.
+        let (_dir, found) = secrets(&[(".env", "DB_PASSWORD=hunter22\n")]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].weight, Weight::Note);
+    }
+
+    #[test]
+    fn a_long_secret_says_nothing() {
+        let (_dir, found) = secrets(&[(
+            ".env",
+            "JWT_SECRET=3a08ce3caa113c649e12e3eed0d1fcee9d89979a07bfc77ae34e9e38bc40f69a\n",
+        )]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_flag_that_merely_contains_a_secret_word_is_not_a_secret() {
+        // Real: `ALLOW_PRIVATE_TARGETS=true` holds PRIVATE as a whole segment. Only
+        // the ending says what a variable is for.
+        let (_dir, found) = secrets(&[(
+            ".env",
+            "ALLOW_PRIVATE_TARGETS=true\nSORT_KEY=name\nAPI_KEY_ID=abc\n",
+        )]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_placeholder_meaning_nothing_is_set_is_not_a_weak_secret() {
+        // Real: Laravel writes `REDIS_PASSWORD=null` for "there is no password". That
+        // is not a weak secret, and "unset" is a different complaint with other words.
+        let (_dir, found) = secrets(&[(
+            ".env",
+            "REDIS_PASSWORD=null\nMAIL_PASSWORD=none\nDEBUG_TOKEN=false\nRETRY_TOKEN=3\n",
+        )]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_secret_nothing_resolves_is_not_guessed_at() {
+        let (_dir, found) =
+            secrets(&[(".env", "JWT_SECRET=${FROM_VAULT}\nAPI_TOKEN=\nBARE_TOKEN\n")]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn an_example_file_is_where_short_values_belong() {
+        let (_dir, found) = secrets(&[
+            (".env", "A=1\n"),
+            (".env.example", "JWT_SECRET=changeme\nDB_PASSWORD=short\n"),
+        ]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_secret_typed_into_the_compose_file_counts() {
+        // Worse than a short one in a gitignored `.env`: this one is committed.
+        let (_dir, found) = secrets(&[
+            (".env", "A=1\n"),
+            (
+                "docker-compose.yml",
+                "services:\n  minio:\n    environment:\n      MINIO_SECRET_KEY: shortish\n",
+            ),
+        ]);
+        assert_eq!(found.len(), 1, "{found:?}");
+    }
+
+    #[test]
+    fn no_secret_finding_carries_the_secret() {
+        let (_dir, found) = secrets(&[(".env", "JWT_SECRET=hunter2\nAPI_TOKEN=changeme\n")]);
+        for finding in &found {
+            let said = format!("{} {:?}", finding.what, finding.because);
+            assert!(!said.contains("hunter2"), "leaked: {said}");
+            assert!(!said.contains("changeme"), "leaked: {said}");
+        }
     }
 
     #[test]

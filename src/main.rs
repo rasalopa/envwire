@@ -53,6 +53,7 @@ fn run(cli: &Cli) -> Result<u8> {
     let mut findings = check::documented(&project);
     findings.extend(check::reachable(&project));
     findings.extend(check::set_twice(&project));
+    findings.extend(check::weak_secrets(&project));
 
     // `check` says only what is wrong: a note is not wrong, and a CI log full of
     // remarks nobody has to act on is how a build check gets muted.
