@@ -175,15 +175,26 @@ pub fn set_twice(project: &Project) -> Vec<Finding> {
 pub fn in_version_control(project: &Project) -> Vec<Finding> {
     let mut findings = Vec::new();
     for file in project.files.iter().filter(|f| f.kind == SourceKind::Env) {
-        let Some(folder) = file.path.parent() else {
+        let (Some(folder), Some(name)) = (file.path.parent(), file.path.file_name()) else {
             continue;
         };
+        // The name alone, never the path: git resolves a pathspec against the working
+        // directory, and that is already this file's folder. Handing it the whole
+        // relative path made git look for `proj/proj/.env`, so a committed file went
+        // unreported whenever envwire was pointed at a relative directory.
         let asked = Command::new("git")
+            // A folder named `pr[1]` is a path, not a pattern. This one belongs to
+            // git itself, before the subcommand, or `ls-files` refuses it outright.
+            .arg("--literal-pathspecs")
             .arg("ls-files")
             .arg("--error-unmatch")
             .arg("--")
-            .arg(&file.path)
+            .arg(name)
             .current_dir(folder)
+            // An inherited GIT_DIR would answer for a repository that is not this one.
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
             .output();
         // Only an answered, successful `yes` counts.
         let tracked = asked.map(|out| out.status.success()).unwrap_or(false);
