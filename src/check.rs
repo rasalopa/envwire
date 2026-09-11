@@ -271,6 +271,18 @@ const LEFT_AS_WRITTEN: &[&str] = &[
 /// Below this a secret is guessable by any modern standard.
 const SHORT: usize = 16;
 
+/// Whether the value names a file rather than holding a secret.
+///
+/// `GOOGLE_APPLICATION_CREDENTIALS` ends in CREDENTIALS and holds a path. Measuring
+/// how long that path is says nothing about how strong anything is.
+fn is_a_path(value: &str) -> bool {
+    value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('~')
+        || (value.len() > 2 && value.as_bytes()[1] == b':' && value.contains('\\'))
+}
+
 /// A secret left at its placeholder, or short enough to guess.
 ///
 /// Never says the value. A finding that quotes the secret it is complaining about puts
@@ -292,7 +304,9 @@ pub fn weak_secrets(project: &Project) -> Vec<Finding> {
             return;
         }
         let plain = text.to_ascii_lowercase();
-        if NOT_A_SECRET_VALUE.contains(&plain.as_str()) || text.chars().all(|c| c.is_ascii_digit())
+        if NOT_A_SECRET_VALUE.contains(&plain.as_str())
+            || text.chars().all(|c| c.is_ascii_digit())
+            || is_a_path(text)
         {
             return;
         }
@@ -321,6 +335,18 @@ pub fn weak_secrets(project: &Project) -> Vec<Finding> {
             let Some(value) = &setting.value else {
                 continue;
             };
+            // Only the assignment that wins is worth judging. `set_twice` already says
+            // the earlier one changes nothing, and complaining that a dead line holds a
+            // placeholder contradicts it -- nothing runs with that value.
+            let wins = file
+                .settings
+                .iter()
+                .rev()
+                .find(|other| other.key == setting.key && other.value.is_some())
+                .is_some_and(|last| last.line == setting.line);
+            if !wins {
+                continue;
+            }
             judge(
                 &setting.key,
                 value,
@@ -336,7 +362,13 @@ pub fn weak_secrets(project: &Project) -> Vec<Finding> {
     // repository ignores: this one is committed.
     for service in &project.services {
         for var in &service.vars {
-            if !matches!(var.bound.origin, Origin::Inline { .. }) || var.bound.via.is_some() {
+            // An interpolated value is not the value CI will run with: envwire never
+            // reads the shell, and `${SECRET:-placeholder}` is exactly how a compose
+            // file carries a local default while CI injects the real one.
+            if !matches!(var.bound.origin, Origin::Inline { .. })
+                || var.bound.via.is_some()
+                || var.bound.interpolated
+            {
                 continue;
             }
             judge(&var.key, &var.bound.value, var.bound.origin.clone());
@@ -884,6 +916,63 @@ mod tests {
         let project = model::read(&sources::discover(dir.path())).unwrap();
         let found = weak_secrets(&project);
         (dir, found)
+    }
+
+    #[test]
+    fn a_compose_default_is_not_the_value_ci_will_run_with() {
+        // `${DB_PASSWORD:-secret}` is how a compose file carries a local default while
+        // CI injects the real secret through the shell. envwire never reads the shell,
+        // so the default is all it sees -- and failing the build on it breaks exactly
+        // the setups that do this right. Verified: with DB_PASSWORD exported, Docker
+        // hands the container the exported value, never `secret`.
+        let (_dir, found) = secrets(&[(
+            "docker-compose.yml",
+            "services:\n  api:\n    environment:\n      DB_PASSWORD: ${DB_PASSWORD:-secret}\n",
+        )]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_secret_typed_straight_into_compose_is_still_judged() {
+        // No interpolation here, so what is written is what the container gets.
+        let (_dir, found) = secrets(&[(
+            "docker-compose.yml",
+            "services:\n  api:\n    environment:\n      DB_PASSWORD: changeme\n",
+        )]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].weight, Weight::Problem);
+    }
+
+    #[test]
+    fn a_dead_assignment_is_not_judged_for_its_value() {
+        // `set_twice` already says line 1 changes nothing. Complaining that the line
+        // holds a placeholder contradicts it, and nothing runs with that value.
+        let (_dir, found) = secrets(&[(
+            ".env",
+            "DB_PASSWORD=changeme\nDB_PASSWORD=k7Qz2wLm9XvBt4Rp8ScE\n",
+        )]);
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn the_winning_assignment_is_still_judged() {
+        let (_dir, found) = secrets(&[(
+            ".env",
+            "DB_PASSWORD=k7Qz2wLm9XvBt4Rp8ScE\nDB_PASSWORD=changeme\n",
+        )]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(matches!(found[0].at, Origin::Line { line: 2, .. }));
+    }
+
+    #[test]
+    fn a_path_is_not_a_secret_even_when_the_key_sounds_like_one() {
+        // `GOOGLE_APPLICATION_CREDENTIALS` ends in CREDENTIALS and holds a file name.
+        // Measuring its length says nothing about how strong anything is.
+        let (_dir, found) = secrets(&[(
+            ".env",
+            "GOOGLE_APPLICATION_CREDENTIALS=/etc/gcp.json\nTLS_CERT_PASSWORD=./certs/p.pem\nSSH_KEY_PASSPHRASE=~/.ssh/id\n",
+        )]);
+        assert!(found.is_empty(), "{found:?}");
     }
 
     #[test]

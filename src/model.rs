@@ -54,6 +54,12 @@ pub struct Bound {
     /// Set only when the whole value was one reference: a value glued from text and
     /// several references has no single line worth naming.
     pub via: Option<Origin>,
+    /// Whether the text named a variable at all.
+    ///
+    /// `${DB_PASSWORD:-secret}` resolves to `secret` here because envwire never reads
+    /// the shell -- and injecting the real value through the shell is how CI is
+    /// supposed to work. A check that judges the value itself must not judge this one.
+    pub interpolated: bool,
 }
 
 /// One line of a `.env`-shaped file.
@@ -321,6 +327,7 @@ fn fold(
                             line: setting.line,
                         },
                         via: None,
+                        interpolated: false,
                     },
                     layer,
                 ),
@@ -340,6 +347,7 @@ fn fold(
                                     line: setting.line,
                                 },
                                 via: Some(found.origin.clone()),
+                                interpolated: false,
                             },
                             layer,
                         );
@@ -379,6 +387,7 @@ fn fold(
                     origin: Origin::Inline {
                         service: service.name.clone(),
                     },
+                    interpolated: template.has_refs(),
                 }
             }
             // A bare `- KEY` is a use, never a definition: the service asks for
@@ -391,6 +400,8 @@ fn fold(
                         service: service.name.clone(),
                     },
                     via: found.map(|bound| bound.origin.clone()),
+                    // A bare name asks the shell first, and envwire cannot see it.
+                    interpolated: true,
                 }
             }
         };
@@ -530,6 +541,7 @@ fn interpolation_of(files: &[EnvFile]) -> Interpolation {
                     line: setting.line,
                 },
                 via: None,
+                interpolated: false,
             },
         );
     }

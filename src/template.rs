@@ -165,7 +165,8 @@ impl Template {
         }
     }
 
-    fn has_refs(&self) -> bool {
+    /// Whether any part of this text names a variable.
+    pub fn has_refs(&self) -> bool {
         self.0
             .iter()
             .any(|s| matches!(s, Segment::Reference { .. }))
