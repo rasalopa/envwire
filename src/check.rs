@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::process::Command;
 
 use crate::model::{Origin, Project};
 use crate::sources::SourceKind;
@@ -157,6 +158,52 @@ pub fn set_twice(project: &Project) -> Vec<Finding> {
                 because: None,
             });
         }
+    }
+    findings
+}
+
+/// A file a developer's own values live in, committed to the repository.
+///
+/// The one finding here that needs no judgement: whatever is in that file is in the
+/// history, on every clone, and in every fork. An example file is exempt -- being
+/// committed is what it is for.
+///
+/// Asks git and believes only a clear yes. A repository envwire cannot ask about --
+/// no git on the machine, not a work tree, a command that failed for any reason --
+/// produces silence. Guessing here would accuse people of leaking secrets they did
+/// not leak.
+pub fn in_version_control(project: &Project) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    for file in project.files.iter().filter(|f| f.kind == SourceKind::Env) {
+        let Some(folder) = file.path.parent() else {
+            continue;
+        };
+        let asked = Command::new("git")
+            .arg("ls-files")
+            .arg("--error-unmatch")
+            .arg("--")
+            .arg(&file.path)
+            .current_dir(folder)
+            .output();
+        // Only an answered, successful `yes` counts.
+        let tracked = asked.map(|out| out.status.success()).unwrap_or(false);
+        if !tracked {
+            continue;
+        }
+        findings.push(Finding {
+            weight: Weight::Problem,
+            what: format!(
+                "{} is committed, so whatever it holds is in the history and every clone",
+                file.path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            ),
+            at: Origin::File {
+                path: file.path.clone(),
+            },
+            because: None,
+        });
     }
     findings
 }
@@ -922,6 +969,93 @@ mod tests {
             let said = format!("{} {:?}", finding.what, finding.because);
             assert!(!said.contains("hunter2"), "leaked: {said}");
             assert!(!said.contains("changeme"), "leaked: {said}");
+        }
+    }
+
+    /// A git repository with `files` in it, some of them committed.
+    fn repo(files: &[(&str, &str)], tracked: &[&str]) -> TempDir {
+        let dir = tempdir().unwrap();
+        for (name, body) in files {
+            fs::write(dir.path().join(name), body).unwrap();
+        }
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        for name in tracked {
+            git(&["add", "--", name]);
+        }
+        if !tracked.is_empty() {
+            git(&["commit", "-qm", "first"]);
+        }
+        dir
+    }
+
+    fn committed(dir: &TempDir) -> Vec<Finding> {
+        let project = model::read(&sources::discover(dir.path())).unwrap();
+        in_version_control(&project)
+    }
+
+    #[test]
+    fn a_committed_env_file_is_a_problem() {
+        let dir = repo(&[(".env", "SECRET=x\n")], &[".env"]);
+        let found = committed(&dir);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].weight, Weight::Problem);
+        // The finding is about the file, so it names no line.
+        assert!(
+            matches!(found[0].at, Origin::File { .. }),
+            "{:?}",
+            found[0].at
+        );
+    }
+
+    #[test]
+    fn an_ignored_env_file_says_nothing() {
+        let dir = repo(
+            &[(".env", "SECRET=x\n"), (".gitignore", ".env\n")],
+            &[".gitignore"],
+        );
+        assert!(committed(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_committed_example_file_is_the_whole_point_of_it() {
+        let dir = repo(
+            &[
+                (".env", "A=1\n"),
+                (".env.example", "A=\n"),
+                (".gitignore", ".env\n"),
+            ],
+            &[".env.example", ".gitignore"],
+        );
+        assert!(committed(&dir).is_empty());
+    }
+
+    #[test]
+    fn a_project_that_is_not_a_repository_is_not_accused() {
+        // No git here at all. Silence is the only honest answer.
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".env"), "SECRET=x\n").unwrap();
+        let project = model::read(&sources::discover(dir.path())).unwrap();
+        assert!(in_version_control(&project).is_empty());
+    }
+
+    #[test]
+    fn no_committed_finding_carries_a_value() {
+        let dir = repo(&[(".env", "SECRET=hunter2\n")], &[".env"]);
+        for finding in committed(&dir) {
+            assert!(
+                !finding.what.contains("hunter2"),
+                "leaked: {}",
+                finding.what
+            );
         }
     }
 

@@ -16,8 +16,18 @@ use crate::template::{Template, Use, Value};
 /// precise as it is honest to be. That second shape arrives with the services.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
-    Line { path: PathBuf, line: usize },
-    Inline { service: String },
+    Line {
+        path: PathBuf,
+        line: usize,
+    },
+    Inline {
+        service: String,
+    },
+    /// A whole file. Some findings are about the file itself -- that it exists, that
+    /// it is committed -- and naming a line in it would point at nothing.
+    File {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for Origin {
@@ -25,6 +35,7 @@ impl fmt::Display for Origin {
         match self {
             Origin::Line { path, line } => write!(f, "{}:{line}", path.display()),
             Origin::Inline { service } => write!(f, "service {service}"),
+            Origin::File { path } => write!(f, "{}", path.display()),
         }
     }
 }

@@ -54,6 +54,7 @@ fn run(cli: &Cli) -> Result<u8> {
     findings.extend(check::reachable(&project));
     findings.extend(check::set_twice(&project));
     findings.extend(check::weak_secrets(&project));
+    findings.extend(check::in_version_control(&project));
 
     // `check` says only what is wrong: a note is not wrong, and a CI log full of
     // remarks nobody has to act on is how a build check gets muted.
@@ -114,6 +115,11 @@ fn report_findings(findings: &[Finding], target: &Path, summarise: bool) {
                 let short = path.strip_prefix(target).unwrap_or(path);
                 format!("{}:{line}", short.display())
             }
+            crate::model::Origin::File { path } => path
+                .strip_prefix(target)
+                .unwrap_or(path)
+                .display()
+                .to_string(),
             other => other.to_string(),
         };
         println!("{mark} {}", finding.what);
