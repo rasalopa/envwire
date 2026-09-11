@@ -79,7 +79,7 @@ pub fn parse(text: &str) -> Document {
         };
 
         let key = raw_key.trim();
-        if !is_name(key) {
+        if !written_as_a_name(key) {
             doc.malformed.push(Malformed {
                 line: line_no,
                 text: trimmed.to_string(),
@@ -114,6 +114,24 @@ pub(crate) fn is_name(name: &str) -> bool {
         _ => return false,
     }
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether `name` is a name a person would have written, not merely a legal one.
+///
+/// `is_name` is about what a shell accepts; this is about what somebody typed. A base64
+/// line carrying `=` padding splits like an assignment and its left half is a legal
+/// name, so a key block whose `-----END` never arrived turned private-key bytes into a
+/// variable name -- and envwire printed it. Nobody writes a variable name in mixed
+/// case; every base64 line is mixed.
+///
+/// The two costs are not equal. Declining a real `MyVar` costs silence about one key.
+/// Accepting a key line costs the key.
+pub(crate) fn written_as_a_name(name: &str) -> bool {
+    if !is_name(name) {
+        return false;
+    }
+    let letters = || name.chars().filter(|c| c.is_ascii_alphabetic());
+    !(letters().any(|c| c.is_ascii_uppercase()) && letters().any(|c| c.is_ascii_lowercase()))
 }
 
 /// Resolve the value that starts at `first`, borrowing `rest` when a quote stays open.
@@ -379,6 +397,32 @@ mod tests {
     #[test]
     fn carriage_returns_do_not_end_up_in_values() {
         assert_eq!(values("KEY=value\r\nOTHER=2\r\n")[0].1, "value");
+    }
+
+    #[test]
+    fn a_key_no_person_would_write_is_not_accepted_as_one() {
+        // A base64 line carrying `=` padding splits like an assignment and its left
+        // half passes `is_name`, so a TRUNCATED key block -- one whose `-----END` got
+        // lost in the paste -- turned private-key bytes into a variable name that was
+        // then printed. Reproduced with real keys before this was written.
+        let doc = parse(
+            "APP_NAME=demo\nPRIVATE_KEY=-----BEGIN PRIVATE KEY-----\nMIIEvwIBADANBgkqhkiG9w0BAQEFAASCBKkwggSl\nb7XRt6A7vtrQbKGmQ8IGie8V2g==\nDB_HOST=db\n",
+        );
+        let keys: Vec<&str> = doc.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, ["APP_NAME", "PRIVATE_KEY", "DB_HOST"]);
+        // It is still counted as unreadable, which is honest, and `malformed` text is
+        // never printed.
+        assert!(!doc.malformed.is_empty());
+    }
+
+    #[test]
+    fn an_ordinary_name_in_either_case_is_still_accepted() {
+        let doc = parse("UPPER_NAME=1\nlower_name=2\n_LEADING=3\nWITH2DIGITS=4\n");
+        let keys: Vec<&str> = doc.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            ["UPPER_NAME", "lower_name", "_LEADING", "WITH2DIGITS"]
+        );
     }
 
     #[test]

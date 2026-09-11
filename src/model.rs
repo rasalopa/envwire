@@ -459,7 +459,7 @@ fn settings_of(doc: dotenv::Document, kind: SourceKind) -> (Vec<Setting>, Vec<Ma
             malformed.push(bad);
             continue;
         }
-        if written_as_a_name(&bad.text) {
+        if dotenv::written_as_a_name(&bad.text) {
             settings.push(Setting {
                 key: bad.text.clone(),
                 value: None,
@@ -478,23 +478,6 @@ fn settings_of(doc: dotenv::Document, kind: SourceKind) -> (Vec<Setting>, Vec<Ma
 
     settings.sort_by_key(|setting| setting.line);
     (settings, malformed)
-}
-
-/// Whether an unreadable line is plausibly somebody asking for a variable.
-///
-/// `is_name` alone is too generous here. A base64 body line passes it, so a blob
-/// pasted into a `.env` gets recovered as a pass-through and then PRINTED as a
-/// variable name -- which put real private-key bytes on stdout before this existed.
-///
-/// Nobody writes a variable name in mixed case, and every base64 line is mixed. The
-/// cost of being wrong in each direction is not equal: declining to recover a real
-/// `MyVar` costs silence, while recovering a key line costs the secret.
-fn written_as_a_name(text: &str) -> bool {
-    if !dotenv::is_name(text) {
-        return false;
-    }
-    let letters = || text.chars().filter(|c| c.is_ascii_alphabetic());
-    !(letters().any(|c| c.is_ascii_uppercase()) && letters().any(|c| c.is_ascii_lowercase()))
 }
 
 /// Read `NAME: value` by swapping the delimiter and letting dotenv.rs do the rest.
